@@ -1,0 +1,53 @@
+# Wuzu Scanner Configuration File
+
+[database]
+# PostgreSQL connection settings
+host = "localhost"
+port = 5432
+database = "wuzu_game"
+user = "wuzu_user"
+password = "your_password_here"
+
+[hardware]
+# UHF Reader settings
+uhf_port = "COM9"           # Windows: "COM3", "COM9", etc. | Linux: "/dev/ttyUSB0"
+                            # Set to null for auto-detection
+uhf_baudrate = 57600        # Usually 57600 or 115200
+uhf_power = 20              # RF Power in dBm (0-30, higher = longer range)
+
+[timing]
+# Time in seconds before scan ends after last wuzu found
+scan_timeout = 5
+
+# Time to display results before returning to main screen
+results_display = 10
+
+# Delay between UHF inventory scans (in seconds)
+scan_interval = 0.2
+
+# Delay between NFC card polls (in seconds)
+nfc_poll_interval = 0.05
+
+# How often to refresh leaderboard from database (in seconds)
+leaderboard_refresh = 60
+
+[audio]
+# Enable/disable all beeps
+beep_enabled = true
+
+# Beep configurations: [active_time, silent_time, times]
+# active_time: beep duration in 100ms units (1 = 100ms, 2 = 200ms)
+# silent_time: pause between beeps in 100ms units
+# times: number of beeps
+
+[audio.beeps]
+new_wuzu = [1, 0, 1]        # Quick single beep when wuzu is found
+hunter_id = [0, 0, 0]       # Longer beep when hunter scans badge
+complete = [0, 0, 0]        # Triple beep pattern when scan complete
+
+[display]
+# Character used for borders
+border_char = "─"
+
+# Title displayed in various screens
+title = "WUZU SCANNER"

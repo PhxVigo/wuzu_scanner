@@ -302,7 +302,7 @@ class UHFReader:
     def __init__(self, port=None, baud=57600):
         self.ser = None
         if not SERIAL_AVAILABLE:
-            print("[UHF] Serial support unavailable — demo mode.")
+            print("[UHF] Serial support unavailable - demo mode.")
             return
 
         # Auto-detect

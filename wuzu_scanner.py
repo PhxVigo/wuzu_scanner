@@ -58,7 +58,7 @@ if platform.system() == "Windows":
         if msvcrt.kbhit():
             ch = msvcrt.getch()
             try:
-                return ch.decode("utf-8").lower()
+                return ch.decode("utf-8")
             except:
                 return None
         return None
@@ -67,7 +67,7 @@ else:
     def read_key():
         dr, _, _ = select.select([sys.stdin], [], [], 0)
         if dr:
-            return sys.stdin.read(1).lower()
+            return sys.stdin.read(1)
         return None
 
 
@@ -405,6 +405,17 @@ class DatabaseManager:
                 return cur.fetchone() is not None
         except:
             return False
+
+    def hunter_name_exists(self, name):
+        """Check if hunter name already exists (case-insensitive)"""
+        if not self.conn:
+            return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM hunters WHERE LOWER(name) = LOWER(%s)", (name,))
+                return cur.fetchone() is not None
+        except:
+            return False
     
     # === WUZUS ===
     def add_wuzu(self, epc, points_value=10):
@@ -715,35 +726,74 @@ class StartScreen(Screen):
 class AddHunterScreen(Screen):
     header_title = "ADD NEW HUNTER"
 
+    # States
+    STATE_SCAN = "scan"
+    STATE_NAME = "name"
+    STATE_CONFIRM = "confirm"
+    STATE_ERROR = "error"
+
     def __init__(self, app):
         super().__init__(app)
+        self.state = self.STATE_SCAN
         self.uid = None
         self.name_input = ""
+        self.error_msg = ""
 
     def handle(self, key, uid):
-        if self.uid is None:
+        if self.state == self.STATE_SCAN:
+            if key == "x":
+                self.app.log_event("CANCEL", details="Add-Hunter cancelled")
+                self.app.switch_screen(StartScreen(self.app))
+                return            
             if uid:
-                # Check if already exists
+                # Check if UID already exists
                 if self.app.db.hunter_exists(uid):
                     self.app.log_event("DUPLICATE", details=f"Hunter {uid} already registered")
+                    self.error_msg = f"UID {uid} already registered!"
+                    self.state = self.STATE_ERROR
+                else:
+                    self.uid = uid
+                    self.state = self.STATE_NAME
+                self.app.tui.force_full_redraw()
+
+        elif self.state == self.STATE_NAME:
+            if key in ["\n", "\r"]:
+                if self.name_input.strip():
+                    self.state = self.STATE_CONFIRM
+                    self.app.tui.force_full_redraw()
+            elif key == "\x7f" or key == "\x08":  # Backspace
+                self.name_input = self.name_input[:-1]
+                self.app.tui.mark_dirty("footer")
+            elif key and len(key) == 1 and (key.isalnum() or key in ' -'):
+                self.name_input += key
+                self.app.tui.mark_dirty("footer")
+
+        elif self.state == self.STATE_CONFIRM:
+            if key == "x":
+                self.app.log_event("CANCEL", details="Add-Hunter cancelled")
+                self.app.switch_screen(StartScreen(self.app))
+                return
+            if key in ["y", "\n", "\r"]:
+                # Check name uniqueness
+                name = self.name_input.strip()
+                if self.app.db.hunter_name_exists(name):
+                    self.error_msg = f"Name '{name}' already taken!"
+                    self.state = self.STATE_ERROR
+                else:
+                    # Commit to database
+                    self.app.register_hunter(self.uid, name)
                     self.app.switch_screen(StartScreen(self.app))
                     return
-                self.uid = uid
                 self.app.tui.force_full_redraw()
-            return
+            elif key == "n":
+                # Go back to name entry
+                self.state = self.STATE_NAME
+                self.app.tui.force_full_redraw()
 
-        if key in ["\n", "\r"]:
-            if self.name_input.strip():
-                self.app.register_hunter(self.uid, self.name_input.strip())
+        elif self.state == self.STATE_ERROR:
+            # Any key returns to start
+            if key:
                 self.app.switch_screen(StartScreen(self.app))
-            return
-
-        if key == "\x7f":
-            self.name_input = self.name_input[:-1]
-        elif key and len(key) == 1 and ord(key) >= 32:
-            self.name_input += key
-
-        self.app.tui.mark_dirty("footer")
 
     def render_hunters(self, terminal, app_state, cols, rows):
         self.render_empty_panel(terminal, 2, 14, cols)
@@ -754,10 +804,30 @@ class AddHunterScreen(Screen):
         self.render_empty_panel(terminal, start, h, cols)
 
     def render_footer(self, terminal, app_state, cols, rows):
-        if not self.uid:
-            lines = ["Scan new hunter badge...", ""]
+        if self.state == self.STATE_SCAN:
+            lines = [
+                "Scan new hunter badge...",
+                "[X] Cancel"
+            ]
+        elif self.state == self.STATE_NAME:
+            lines = [
+                f"UID: {self.uid}",
+                f"Name: {self.name_input}_",
+                "Enter name and press ENTER"
+            ]
+        elif self.state == self.STATE_CONFIRM:
+            lines = [
+                f"UID: {self.uid}",
+                f"Name: {self.name_input.strip()}",
+                "Confirm? [Y/n]  [X] Cancel"
+            ]
+        elif self.state == self.STATE_ERROR:
+            lines = [
+                self.error_msg,
+                "Press any key to continue..."
+            ]
         else:
-            lines = [f"UID: {self.uid}", f"Name: {self.name_input}"]
+            lines = ["", ""]
 
         self.draw_footer(terminal, cols, rows, "ADD HUNTER", lines)
 
@@ -952,13 +1022,12 @@ class WuzuApp:
         self.db_status = db_status['status']
         
         if db_status['status'] != 'OFFLINE':
-            print(f"[DB] Connection test successful")
-            print(f"[DB] Status: {db_status['status']}")
             if db_status['version']:
                 # Extract just the PostgreSQL version number
                 version_parts = db_status['version'].split()
                 if len(version_parts) > 1:
                     print(f"[DB] PostgreSQL {version_parts[1]}")
+            print(f"[DB] Status: {db_status['status']}")
         else:
             print(f"[DB] WARNING: Database offline - running in demo mode")
 

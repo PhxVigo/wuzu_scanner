@@ -116,7 +116,7 @@ class BoundedTerminal:
     Automatically draws borders and handles panel title bars.
     """
     def __init__(self, terminal, start_row, end_row, start_col=0, end_col=None, 
-                 draw_borders=True, top_border="├", bottom_border=None):
+                 draw_borders=True):
         self.terminal = terminal
         self.start_row = start_row
         self.end_row = end_row
@@ -126,8 +126,6 @@ class BoundedTerminal:
         self.end_col = end_col if end_col is not None else term_cols
         
         self.draw_borders = draw_borders
-        self.top_border = top_border
-        self.bottom_border = bottom_border
         
         # Clear the entire panel area first
         self._clear_panel()
@@ -147,23 +145,17 @@ class BoundedTerminal:
         """Draw the panel borders"""
         cols = self.end_col - self.start_col
         
-        # Top border
-        if self.top_border:
-            right_corner = "┤" if self.top_border == "├" else "┐"
-            self.terminal.print_row(self.start_row, 
-                self.top_border + "─" * (cols - 2) + right_corner)
+        # Top border - always use ├─┤
+        self.terminal.print_row(self.start_row, 
+            "├" + "─" * (cols - 2) + "┤")
         
         # Side borders for all content rows
-        for row in range(self.start_row + 1, self.end_row - (1 if self.bottom_border else 0)):
+        border_end = self.end_row
+        for row in range(self.start_row + 1, border_end):
             self.terminal.move_to(row, self.start_col)
             print("│", end="")
             self.terminal.move_to(row, self.end_col - 1)
             print("│", end="")
-        
-        # Bottom border
-        if self.bottom_border:
-            self.terminal.print_row(self.end_row - 1,
-                self.bottom_border + "─" * (cols - 2) + "┘")
     
     def size(self):
         """Return the bounded panel size (cols, rows)"""
@@ -189,7 +181,7 @@ class BoundedTerminal:
         """Print content inside the borders (auto-insets by 1 col on each side)"""
         abs_row = self.start_row + row
         
-        if self.start_row < abs_row < self.end_row - (1 if self.bottom_border else 0):
+        if self.start_row < abs_row < self.end_row:
             content_width = self.end_col - self.start_col - 4  # -4 for "│ " and " │"
             truncated = text[:content_width].ljust(content_width)
             self.terminal.move_to(abs_row, self.start_col + 2)  # +2 for "│ "
@@ -216,7 +208,7 @@ class BoundedTerminal:
         """Clear all content inside the borders"""
         content_width = self.end_col - self.start_col - 4
         empty = " " * content_width
-        for row in range(self.start_row + 1, self.end_row - (1 if self.bottom_border else 0)):
+        for row in range(self.start_row + 1, self.end_row):
             self.terminal.move_to(row, self.start_col + 2)
             print(empty, end="")
     
@@ -670,13 +662,29 @@ class DatabaseManager:
             self.conn.close()
             print("[DB] Connection closed")
 
+# =============================================================================
+# PANEL NAME CONSTANTS
+# =============================================================================
+PANEL_TITLE     = "title_bar"
+PANEL_STATUS    = "status_bar"
+PANEL_MAIN      = "main"
+PANEL_SECONDARY = "secondary"
+PANEL_FOOTER    = "footer"
+
+ALL_PANELS = [
+    PANEL_TITLE,
+    PANEL_STATUS,
+    PANEL_MAIN,
+    PANEL_SECONDARY,
+    PANEL_FOOTER,
+]
 
 # =============================================================================
 # TUI ENGINE WITH DYNAMIC PANEL SIZING
 # =============================================================================
 class TUIEngine:
     def __init__(self):
-        self.panels = {"status": True, "main": True, "secondary": True, "footer": True}
+        self.panels = {panel: True for panel in ALL_PANELS} # All panels start dirty
 
     def mark_dirty(self, panel):
         """Mark a panel for re-rendering"""
@@ -693,9 +701,10 @@ class TUIEngine:
         Define the physical panel layout based on screen preferences.
         Returns dict of panel_name -> (start_row, end_row)
         """
-        STATUS_H = 1
-        FOOTER_H = 5
-        available = rows - (STATUS_H + FOOTER_H)
+        TITLE_BAR_H = 1
+        STATUS_BAR_H = 1
+        FOOTER_H = 4
+        available = rows - (STATUS_BAR_H + FOOTER_H + TITLE_BAR_H)
         
         # Ask the screen how it wants to divide the available space
         sizes = screen.get_panel_sizes(available)
@@ -710,17 +719,16 @@ class TUIEngine:
             main_h = int(available * (main_h / total))
             sec_h = available - main_h
         
-        layout = {
-            "status": (0, STATUS_H),
-            "main": (STATUS_H, STATUS_H + main_h),
-        }
-        
+        #Define panel layout (start_row, end_row)
+        layout = {}
+        layout[PANEL_TITLE] = (0, TITLE_BAR_H)
+        layout[PANEL_MAIN] = (TITLE_BAR_H, TITLE_BAR_H + main_h)        
         # Only add secondary if it has height
         if sec_h > 0:
-            layout["secondary"] = (STATUS_H + main_h, STATUS_H + main_h + sec_h)
-        
-        layout["footer"] = (rows - FOOTER_H, rows)
-        
+            layout[PANEL_SECONDARY] = (TITLE_BAR_H + main_h, TITLE_BAR_H + main_h + sec_h)
+        layout[PANEL_FOOTER] = (rows - FOOTER_H - 1, rows - 1)
+        layout[PANEL_STATUS] = (rows -1, rows)
+
         return layout
 
     def render(self, screen, terminal, app_state):
@@ -729,9 +737,10 @@ class TUIEngine:
         layout = self.get_layout(cols, rows, screen)
 
         for panel_name, dirty in self.panels.items():
+            # Skip clean panels
             if not dirty:
                 continue
-            
+
             # Skip panels not in layout (e.g., secondary with 0 height)
             if panel_name not in layout:
                 continue
@@ -739,29 +748,32 @@ class TUIEngine:
             # Get panel bounds
             start_row, end_row = layout[panel_name]
             
-            # Create bounded terminal with appropriate borders
-            if panel_name == "status":
+            # Create bounded terminal
+            if panel_name == PANEL_STATUS:
                 # Status bar: no borders, just content
                 bounded = BoundedTerminal(terminal, start_row, end_row, 0, cols,
                                         draw_borders=False)
-            elif panel_name == "main":
-                # Main: top border (┌) since it's first bordered panel after status
-                bounded = BoundedTerminal(terminal, start_row, end_row, 0, cols,
-                                        draw_borders=True, top_border="┌", bottom_border=None)
-            elif panel_name == "footer":
-                # Footer: bottom border (└)
-                bounded = BoundedTerminal(terminal, start_row, end_row, 0, cols,
-                                        draw_borders=True, top_border="├", bottom_border="└")
             else:
-                # Secondary: middle border (├)
+                # All other panels: standard borders, footer gets bottom corners
                 bounded = BoundedTerminal(terminal, start_row, end_row, 0, cols,
-                                        draw_borders=True, top_border="├", bottom_border=None)
+                                        draw_borders=True)
             
             # Call screen's render method for this panel
-            render_fn = getattr(screen, f"render_{panel_name}", None)
-            if callable(render_fn):
-                render_fn(bounded, app_state)
-            
+            if panel_name == PANEL_STATUS:
+                screen.render_status_bar(bounded, app_state)
+            elif panel_name == PANEL_MAIN:
+                screen.render_main(bounded, app_state)
+            elif panel_name == PANEL_SECONDARY:
+                screen.render_secondary(bounded, app_state)
+            elif panel_name == PANEL_FOOTER:
+                screen.render_footer(bounded, app_state)
+            elif panel_name == PANEL_TITLE:
+                screen.render_title_bar(bounded)                
+            else:
+                # Optional: catch unknown panels
+                print(f"[WARN] No render function for panel '{panel_name}'")
+
+            # Mark panel as clean            
             self.panels[panel_name] = False
 
         sys.stdout.flush()
@@ -775,6 +787,7 @@ class Screen:
 
     def __init__(self, app):
         self.app = app
+        self.screen_main_title = app.config.get('display', {}).get('main_title', 'Wuzu Scanner')
 
     # -------------------------------------------------------------------------
     # PANEL SIZING (Override in subclasses to customize layout)
@@ -795,10 +808,26 @@ class Screen:
             'secondary': available_rows - 16
         }
 
+
+    # -------------------------------------------------------------------------
+    # TITLE BAR (never changes, always in base class)
+    # -------------------------------------------------------------------------
+    def render_title_bar(self, bounded):
+        """Render the main title bar - same for all screens"""
+        cols, _ = bounded.size()
+      
+        title_bar = f"╒═╡  " + self.screen_main_title + "  ╞═"
+        cols = bounded.end_col - bounded.start_col
+        title_bar += "═" * (cols - len(title_bar) - 1) + "╕"
+        
+        # Just print the status text, no borders
+        bounded.print_row(0, title_bar.ljust(cols))
+
+
     # -------------------------------------------------------------------------
     # STATUS BAR (never changes, always in base class)
     # -------------------------------------------------------------------------
-    def render_status(self, bounded, app_state):
+    def render_status_bar(self, bounded, app_state):
         """Render the status bar - same for all screens"""
         cols, _ = bounded.size()
         
@@ -809,10 +838,14 @@ class Screen:
         last_scan = recent[0]['timestamp'].strftime("%H:%M:%S") if recent else "--:--:--"
         
         db_status = self.app.db_status
-        status = f" DB:{db_status} | UPTIME:{uptime} | LAST-SCAN:{last_scan} | TIME:{now} "
+        #status_bar = f"╒═╡ DB:{db_status} - UPTIME:{uptime} - LAST-SCAN:{last_scan} - TIME:{now} ╞═"
+        #status_bar += "═" * (cols - len(status_bar) - 1) + "╕"
+        
+        status_bar = f"═╡ DB:{db_status} - UPTIME:{uptime} - LAST-SCAN:{last_scan} - TIME:{now} ╞═"
+        status_bar = "╘" + "═" * (cols - len(status_bar) - 2) + status_bar + "╛"
         
         # Just print the status text, no borders
-        bounded.print_row(0, status.ljust(cols))
+        bounded.print_row(0, status_bar)
 
     # -------------------------------------------------------------------------
     # MAIN PANEL (Override in subclasses)
@@ -833,7 +866,7 @@ class Screen:
     # -------------------------------------------------------------------------
     def render_footer(self, bounded, app_state):
         """Override this to render footer controls"""
-        bounded.set_title("FOOTER")
+        bounded.set_title(PANEL_FOOTER)
 
     # Default no-op handler
     def handle(self, key, uid):
@@ -951,10 +984,10 @@ class AddHunterScreen(Screen):
                     self.app.tui.force_full_redraw()
             elif key == "\x7f" or key == "\x08":
                 self.name_input = self.name_input[:-1]
-                self.app.tui.mark_dirty("main")
+                self.app.tui.mark_dirty(PANEL_MAIN)
             elif key and len(key) == 1 and (key.isalnum() or key in ' -'):
                 self.name_input += key
-                self.app.tui.mark_dirty("main")
+                self.app.tui.mark_dirty(PANEL_MAIN)
 
         elif self.state == self.STATE_CONFIRM:
             if key == "x":
@@ -1065,7 +1098,7 @@ class AddWuzuScreen(Screen):
                         self.app.tui.force_full_redraw()
                         return
 
-            self.app.tui.mark_dirty("footer")
+            self.app.tui.mark_dirty(PANEL_FOOTER)
         
         elif self.state == self.STATE_ERROR:
             # Any key returns to start
@@ -1139,11 +1172,11 @@ class ScanWuzuScreen(Screen):
                     points = self.app.db.get_wuzu_points(epc)
                     self.app.record_wuzu_scan(self.hunter_uid, epc, points)
                     self.app.beep("new_wuzu")
-                    self.app.tui.mark_dirty("main")
-                    self.app.tui.mark_dirty("footer")
+                    self.app.tui.mark_dirty(PANEL_MAIN)
+                    self.app.tui.mark_dirty(PANEL_FOOTER)
         
         # Mark footer dirty every loop to update countdown timer
-        self.app.tui.mark_dirty("footer")
+        self.app.tui.mark_dirty(PANEL_FOOTER)
 
         if time.time() - self.last_time > self.timeout:
             self.app.beep("complete")
@@ -1195,7 +1228,7 @@ class ResultsScreen(Screen):
         remaining = max(0, self.timeout - elapsed)
         
         # Always update footer to show countdown
-        self.app.tui.mark_dirty("footer")
+        self.app.tui.mark_dirty(PANEL_FOOTER)
         
         if key == "x" or remaining <= 0:
             self.app.switch_screen(StartScreen(self.app))
@@ -1316,7 +1349,7 @@ class WuzuApp:
 
     def log_event(self, event_type, hunter_uid=None, wuzu_epc=None, details="", points=0):
         self.db.log_event(event_type, hunter_uid, wuzu_epc, details, points)
-        self.tui.mark_dirty("secondary")
+        self.tui.mark_dirty(PANEL_SECONDARY)
     
     def record_wuzu_scan(self, hunter_uid, wuzu_epc, points=10):
         """Record a wuzu scan and update scores"""
@@ -1335,6 +1368,7 @@ class WuzuApp:
 
         try:
             while True:
+                time.sleep(self.config.get('timing', {}).get('nfc_poll_interval', 0.05))
                 key = read_key()
                 uid = self.nfc.poll_for_card()
                 self.screen.handle(key, uid)
@@ -1343,12 +1377,12 @@ class WuzuApp:
                 
                 # Update time display every second
                 if now - self.last_time_update >= 1:
-                    self.tui.mark_dirty("status")
+                    self.tui.mark_dirty(PANEL_STATUS)
                     self.last_time_update = now
                 
                 # Refresh leaderboard data periodically
                 if now - self.last_data_refresh >= self.data_refresh_interval:
-                    self.tui.mark_dirty("main")
+                    self.tui.mark_dirty(PANEL_MAIN)
                     self.last_data_refresh = now
                 
                 # Check database health periodically
@@ -1358,7 +1392,7 @@ class WuzuApp:
                         old_status = self.db_status
                         self.db_status = db_status['status']
                         print(f"[DB] Status changed: {old_status} -> {self.db_status}")
-                        self.tui.mark_dirty("status")
+                        self.tui.mark_dirty(PANEL_STATUS)
                     self.last_db_health_check = now
 
                 self.tui.render(self.screen, self.terminal, self.data)
@@ -1411,7 +1445,7 @@ def get_default_config():
         },
         'display': {
             'border_char': '─',
-            'title': 'WUZU SCANNER',
+            'main_title': 'Wuzu Scanner',
         }
     }
 

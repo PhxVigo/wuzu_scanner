@@ -49,5 +49,5 @@ complete = [0, 0, 0]        # Triple beep pattern when scan complete
 # Character used for borders
 border_char = "─"
 
-# Title displayed in various screens
-title = "WUZU SCANNER"
+# Main title displayed in various screens
+main_title = "WUZUScan76 v1.09b"

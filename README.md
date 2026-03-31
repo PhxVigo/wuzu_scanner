@@ -75,7 +75,7 @@ sudo -u postgres createuser wuzu_user -P
 # (Enter password when prompted)
 
 # Grant privileges
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE wuzu-1 TO wuzu_user;"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"wuzu-1\" TO wuzu_user;"
 
 # Load schema
 sudo -u postgres psql wuzu-1 < schema.sql

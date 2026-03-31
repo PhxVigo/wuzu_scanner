@@ -78,11 +78,6 @@ sudo usermod -aG dialout <your_user>
 newgrp dialout
 ```
 
-**Raspberry Pi:**
-```bash
-sudo apt install python3-pip postgresql postgresql-client pcscd libpcsclite-dev
-```
-
 ### 2. Install Python Dependencies
 
 ```bash

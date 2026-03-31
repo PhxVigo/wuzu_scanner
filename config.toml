@@ -1,3 +1,4 @@
+# config.toml
 # Wuzu Scanner Configuration File
 
 [database]
@@ -31,6 +32,18 @@ nfc_poll_interval = 0.05
 # How often to refresh leaderboard from database (in seconds)
 leaderboard_refresh = 60
 
+# Seconds of idle on Main Screen before screen saver activates
+idle_timeout = 30
+
+# Screen saver text movement interval in seconds
+screensaver_interval = 5
+
+# Seconds of idle on Admin Screen before returning to main screen
+admin_timeout = 30
+
+# Seconds before unregistered tag prompt auto-cancels
+unknown_tag_timeout = 10
+
 [audio]
 # Enable/disable all beeps
 beep_enabled = true
@@ -45,9 +58,13 @@ new_wuzu = [1, 0, 1]        # Quick single beep when wuzu is found
 hunter_id = [0, 0, 0]       # Longer beep when hunter scans badge
 complete = [0, 0, 0]        # Triple beep pattern when scan complete
 
+[scoring]
+# Default points value assigned to new wuzus
+default_points = 10
+
 [display]
 # Character used for borders
 border_char = "─"
 
 # Main title displayed in various screens
-main_title = "WUZUScan76 v1.09b"
+main_title = "WUZUScan-76 v1.09b"

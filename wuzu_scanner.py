@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+# wuzu_scanner.py
 """
 WUZU SCANNER - Database-Integrated Version (2025)
 With Bounded Terminal Panel System and Dynamic Panel Sizing
 """
 
-import sys, time, shutil, os, platform
+import sys, time, shutil, os, platform, random
 from collections import deque
 
 # =============================================================================
@@ -492,7 +492,7 @@ class DatabaseManager:
                 cur.execute(
                     """SELECT uid, name, points, last_seen
                        FROM hunters
-                       ORDER BY points DESC, name ASC
+                       ORDER BY points DESC, last_seen ASC, name ASC
                        LIMIT %s""",
                     (limit,)
                 )
@@ -501,6 +501,60 @@ class DatabaseManager:
             print(f"[DB] Error fetching hunters: {e}")
             return []
     
+    def get_hunter_rank(self, uid):
+        """Get a hunter's rank (1-based position on leaderboard)"""
+        if not self.conn:
+            return None
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) + 1
+                       FROM hunters
+                       WHERE points > (SELECT points FROM hunters WHERE uid = %s)
+                          OR (points = (SELECT points FROM hunters WHERE uid = %s)
+                              AND last_seen < (SELECT last_seen FROM hunters WHERE uid = %s))""",
+                    (uid, uid, uid)
+                )
+                result = cur.fetchone()
+                return result[0] if result else None
+        except Exception as e:
+            print(f"[DB] Error fetching hunter rank: {e}")
+            return None
+
+    def get_hunter_total_wuzus(self, uid):
+        """Get total unique wuzus a hunter has scanned (non-deleted SCORE events)"""
+        if not self.conn:
+            return 0
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(DISTINCT wuzu_epc)
+                       FROM scan_events
+                       WHERE hunter_uid = %s AND event_type = 'SCORE' AND deleted = FALSE""",
+                    (uid,)
+                )
+                result = cur.fetchone()
+                return result[0] if result else 0
+        except:
+            return 0
+
+    def get_hunter_total_scans(self, uid):
+        """Get total number of wuzu scans for a hunter (including duplicates across sessions)"""
+        if not self.conn:
+            return 0
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*)
+                       FROM scan_events
+                       WHERE hunter_uid = %s AND event_type = 'SCORE' AND deleted = FALSE""",
+                    (uid,)
+                )
+                result = cur.fetchone()
+                return result[0] if result else 0
+        except:
+            return 0
+
     def get_hunter(self, uid):
         """Get a single hunter by UID"""
         if not self.conn:
@@ -539,7 +593,7 @@ class DatabaseManager:
             return False
     
     # === WUZUS ===
-    def add_wuzu(self, epc, points_value=10):
+    def add_wuzu(self, epc, points_value=None):
         """Add a new wuzu tag"""
         if not self.conn:
             return False
@@ -579,30 +633,110 @@ class DatabaseManager:
         except Exception as e:
             print(f"[DB] Error incrementing wuzu count: {e}")
     
-    def get_wuzu_points(self, epc):
-        """Get points value for a wuzu"""
+    def get_wuzu(self, epc):
+        """Get a single wuzu by EPC"""
         if not self.conn:
-            return 10  # Default
+            return None
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT epc, name, fact, points_value, times_found, deleted FROM wuzus WHERE epc = %s",
+                    (epc,)
+                )
+                return cur.fetchone()
+        except Exception as e:
+            print(f"[DB] Error fetching wuzu: {e}")
+            return None
+
+    def update_wuzu(self, epc, name=None, points_value=None, fact=None):
+        """Update wuzu fields (only non-None values)"""
+        if not self.conn:
+            return False
+        try:
+            updates = []
+            values = []
+            if name is not None:
+                updates.append("name = %s")
+                values.append(name)
+            if points_value is not None:
+                updates.append("points_value = %s")
+                values.append(points_value)
+            if fact is not None:
+                updates.append("fact = %s")
+                values.append(fact)
+            if not updates:
+                return False
+            values.append(epc)
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE wuzus SET {', '.join(updates)} WHERE epc = %s",
+                    values
+                )
+            return True
+        except Exception as e:
+            print(f"[DB] Error updating wuzu: {e}")
+            return False
+
+    def get_wuzu_points(self, epc):
+        """Get points value for a wuzu. Returns 0 for unknown or deleted wuzus."""
+        if not self.conn:
+            return 0
         try:
             with self.conn.cursor() as cur:
-                cur.execute("SELECT points_value FROM wuzus WHERE epc = %s", (epc,))
+                cur.execute("SELECT points_value FROM wuzus WHERE epc = %s AND deleted = FALSE", (epc,))
                 result = cur.fetchone()
-                return result[0] if result else 10
+                return result[0] if result else 0
         except:
-            return 10
+            return 0
     
+    def soft_delete_wuzu(self, epc):
+        """Soft-delete a wuzu by marking it as deleted"""
+        if not self.conn:
+            return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("UPDATE wuzus SET deleted = TRUE WHERE epc = %s", (epc,))
+            return True
+        except Exception as e:
+            print(f"[DB] Error deleting wuzu: {e}")
+            return False
+
+    def restore_wuzu(self, epc):
+        """Restore a soft-deleted wuzu"""
+        if not self.conn:
+            return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("UPDATE wuzus SET deleted = FALSE WHERE epc = %s", (epc,))
+            return True
+        except Exception as e:
+            print(f"[DB] Error restoring wuzu: {e}")
+            return False
+
+    def wuzu_is_deleted(self, epc):
+        """Check if a wuzu is soft-deleted"""
+        if not self.conn:
+            return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT deleted FROM wuzus WHERE epc = %s", (epc,))
+                result = cur.fetchone()
+                return result[0] if result else False
+        except:
+            return False
+
     # === SCAN EVENTS ===
-    def log_event(self, event_type, hunter_uid=None, wuzu_epc=None, details="", points=0):
+    def log_event(self, event_type, hunter_uid=None, wuzu_epc=None, details="", points=0, private=False):
         """Log a scan event"""
         if not self.conn:
             return False
         try:
             with self.conn.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO scan_events 
-                       (event_type, hunter_uid, wuzu_epc, details, points_awarded)
-                       VALUES (%s, %s, %s, %s, %s)""",
-                    (event_type, hunter_uid, wuzu_epc, details, points)
+                    """INSERT INTO scan_events
+                       (event_type, hunter_uid, wuzu_epc, details, points_awarded, private)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (event_type, hunter_uid, wuzu_epc, details, points, private)
                 )
             return True
         except Exception as e:
@@ -610,15 +744,16 @@ class DatabaseManager:
             return False
     
     def get_recent_events(self, limit=50):
-        """Get recent scan events for display"""
+        """Get recent public, non-deleted scan events for main screen display"""
         if not self.conn:
             return []
         try:
             with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    """SELECT timestamp, event_type, hunter_uid, wuzu_epc, 
+                    """SELECT timestamp, event_type, hunter_uid, wuzu_epc,
                               details, points_awarded
                        FROM scan_events
+                       WHERE deleted = FALSE AND private = FALSE
                        ORDER BY timestamp DESC
                        LIMIT %s""",
                     (limit,)
@@ -628,6 +763,238 @@ class DatabaseManager:
             print(f"[DB] Error fetching events: {e}")
             return []
     
+    # === ADMINS ===
+    def admin_exists(self, uid):
+        """Check if UID is an admin"""
+        if not self.conn:
+            return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM admins WHERE uid = %s", (uid,))
+                return cur.fetchone() is not None
+        except:
+            return False
+
+    def add_admin(self, uid, name, password, created_by=None):
+        """Add a new admin with password"""
+        if not self.conn:
+            return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO admins (uid, name, password, created_by)
+                       VALUES (%s, %s, %s, %s)""",
+                    (uid, name, password, created_by)
+                )
+            return True
+        except Exception as e:
+            print(f"[DB] Error adding admin: {e}")
+            return False
+
+    def verify_admin_password(self, uid, password):
+        """Verify admin password. Returns True if correct."""
+        if not self.conn:
+            return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT password FROM admins WHERE uid = %s", (uid,))
+                result = cur.fetchone()
+                if result:
+                    return result[0] == password
+                return False
+        except:
+            return False
+
+    def get_admin(self, uid):
+        """Get admin by UID"""
+        if not self.conn:
+            return None
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT uid, name, created_at FROM admins WHERE uid = %s", (uid,))
+                return cur.fetchone()
+        except:
+            return None
+
+    def admin_name_exists(self, name):
+        """Check if admin name already exists (case-insensitive)"""
+        if not self.conn:
+            return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM admins WHERE LOWER(name) = LOWER(%s)", (name,))
+                return cur.fetchone() is not None
+        except:
+            return False
+
+    # === ADMIN OPERATIONS ===
+    def get_hunter_scan_history(self, hunter_uid):
+        """Get ALL scan events for a hunter including soft-deleted (for admin view)"""
+        if not self.conn:
+            return []
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT id, timestamp, event_type, wuzu_epc, details,
+                              points_awarded, deleted, deleted_by, admin_uid
+                       FROM scan_events
+                       WHERE hunter_uid = %s
+                       ORDER BY timestamp DESC""",
+                    (hunter_uid,)
+                )
+                return cur.fetchall()
+        except Exception as e:
+            print(f"[DB] Error fetching hunter history: {e}")
+            return []
+
+    def soft_delete_event(self, event_id, admin_uid):
+        """Soft delete a scan event and adjust hunter score atomically"""
+        if not self.conn:
+            return False
+        try:
+            old_autocommit = self.conn.autocommit
+            self.conn.autocommit = False
+            try:
+                with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    # Get the event details
+                    cur.execute(
+                        "SELECT hunter_uid, points_awarded FROM scan_events WHERE id = %s AND deleted = FALSE",
+                        (event_id,)
+                    )
+                    event = cur.fetchone()
+                    if not event:
+                        self.conn.rollback()
+                        return False
+
+                    # Mark event as deleted
+                    cur.execute(
+                        "UPDATE scan_events SET deleted = TRUE, deleted_by = %s WHERE id = %s",
+                        (admin_uid, event_id)
+                    )
+
+                    # Subtract points from hunter
+                    if event['points_awarded'] > 0 and event['hunter_uid']:
+                        cur.execute(
+                            """UPDATE hunters
+                               SET points = GREATEST(0, points - %s)
+                               WHERE uid = %s""",
+                            (event['points_awarded'], event['hunter_uid'])
+                        )
+
+                    # Log the admin action (private)
+                    cur.execute(
+                        """INSERT INTO scan_events
+                           (event_type, hunter_uid, details, admin_uid, private)
+                           VALUES ('ADMIN_DELETE', %s, %s, %s, TRUE)""",
+                        (event['hunter_uid'],
+                         f"Deleted event #{event_id} ({event['points_awarded']}pts)",
+                         admin_uid)
+                    )
+
+                    self.conn.commit()
+                return True
+            except:
+                self.conn.rollback()
+                raise
+            finally:
+                self.conn.autocommit = old_autocommit
+        except Exception as e:
+            print(f"[DB] Error soft-deleting event: {e}")
+            return False
+
+    def admin_adjust_score(self, hunter_uid, points, admin_uid, details=""):
+        """Add an admin score adjustment"""
+        if not self.conn:
+            return False
+        try:
+            old_autocommit = self.conn.autocommit
+            self.conn.autocommit = False
+            try:
+                with self.conn.cursor() as cur:
+                    # Update hunter points
+                    cur.execute(
+                        """UPDATE hunters
+                           SET points = GREATEST(0, points + %s), last_seen = NOW()
+                           WHERE uid = %s""",
+                        (points, hunter_uid)
+                    )
+
+                    # Log the adjustment event (private)
+                    detail_text = details if details else f"Admin adjustment: {'+' if points >= 0 else ''}{points}pts"
+                    cur.execute(
+                        """INSERT INTO scan_events
+                           (event_type, hunter_uid, details, points_awarded, admin_uid, private)
+                           VALUES ('ADMIN_ADJUST', %s, %s, %s, %s, TRUE)""",
+                        (hunter_uid, detail_text, points, admin_uid)
+                    )
+
+                    self.conn.commit()
+                return True
+            except:
+                self.conn.rollback()
+                raise
+            finally:
+                self.conn.autocommit = old_autocommit
+        except Exception as e:
+            print(f"[DB] Error adjusting score: {e}")
+            return False
+
+    def log_system_event(self, event_type, admin_uid=None, details="", private=False):
+        """Log system events (SYSTEM_START, SYSTEM_QUIT, ADMIN_PASSWORD_FAIL, etc.)"""
+        if not self.conn:
+            return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO scan_events
+                       (event_type, details, admin_uid, private)
+                       VALUES (%s, %s, %s, %s)""",
+                    (event_type, details, admin_uid, private)
+                )
+            return True
+        except Exception as e:
+            print(f"[DB] Error logging system event: {e}")
+            return False
+
+    def get_recent_admin_events(self, limit=20):
+        """Get recent admin-related events for admin screen"""
+        if not self.conn:
+            return []
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT timestamp, event_type, hunter_uid, details, admin_uid
+                       FROM scan_events
+                       WHERE event_type IN ('ADMIN_DELETE', 'ADMIN_ADJUST', 'ADMIN_ADD',
+                                            'SYSTEM_START', 'SYSTEM_QUIT', 'ADMIN_PASSWORD_FAIL')
+                       ORDER BY timestamp DESC
+                       LIMIT %s""",
+                    (limit,)
+                )
+                return cur.fetchall()
+        except Exception as e:
+            print(f"[DB] Error fetching admin events: {e}")
+            return []
+
+    def get_all_recent_events(self, limit=50):
+        """Get ALL recent scan events for admin view (including private and deleted)"""
+        if not self.conn:
+            return []
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT timestamp, event_type, hunter_uid, wuzu_epc,
+                              details, points_awarded, deleted, private
+                       FROM scan_events
+                       ORDER BY timestamp DESC
+                       LIMIT %s""",
+                    (limit,)
+                )
+                return cur.fetchall()
+        except Exception as e:
+            print(f"[DB] Error fetching all events: {e}")
+            return []
+
     def test_connection(self):
         """Test database connection and return status info"""
         if not self.conn:
@@ -710,14 +1077,19 @@ class TUIEngine:
         sizes = screen.get_panel_sizes(available)
         
         main_h = sizes.get('main', 16)
-        sec_h = sizes.get('secondary', available - main_h)
-        
-        # Ensure sizes fit within available space
-        if main_h + sec_h > available:
-            # Proportionally scale down if too large
-            total = main_h + sec_h
-            main_h = int(available * (main_h / total))
-            sec_h = available - main_h
+        sec_h = sizes.get('secondary')
+
+        if sec_h is None:
+            # Screen explicitly does not want a secondary panel
+            sec_h = 0
+            main_h = min(main_h, available)
+        else:
+            # Screen wants a secondary panel — guarantee at least 2 rows
+            min_secondary = 2
+            sec_h = max(sec_h, min_secondary)
+            if main_h + sec_h > available:
+                main_h = available - sec_h
+            main_h = max(main_h, 1)
         
         #Define panel layout (start_row, end_row)
         layout = {}
@@ -735,6 +1107,7 @@ class TUIEngine:
         """Render all dirty panels"""
         cols, rows = terminal.size()
         layout = self.get_layout(cols, rows, screen)
+        borders = screen.use_borders()
 
         for panel_name, dirty in self.panels.items():
             # Skip clean panels
@@ -744,17 +1117,17 @@ class TUIEngine:
             # Skip panels not in layout (e.g., secondary with 0 height)
             if panel_name not in layout:
                 continue
-                
+
             # Get panel bounds
             start_row, end_row = layout[panel_name]
-            
+
             # Create bounded terminal
-            if panel_name == PANEL_STATUS:
-                # Status bar: no borders, just content
+            if panel_name == PANEL_STATUS or not borders:
+                # Status bar or borderless screens: no borders
                 bounded = BoundedTerminal(terminal, start_row, end_row, 0, cols,
                                         draw_borders=False)
             else:
-                # All other panels: standard borders, footer gets bottom corners
+                # All other panels: standard borders
                 bounded = BoundedTerminal(terminal, start_row, end_row, 0, cols,
                                         draw_borders=True)
             
@@ -788,6 +1161,13 @@ class Screen:
     def __init__(self, app):
         self.app = app
         self.screen_main_title = app.config.get('display', {}).get('main_title', 'Wuzu Scanner')
+
+    # -------------------------------------------------------------------------
+    # BORDER CONTROL (Override in subclasses for borderless screens)
+    # -------------------------------------------------------------------------
+    def use_borders(self):
+        """Return True for bordered panels, False for borderless (e.g. screen saver)"""
+        return True
 
     # -------------------------------------------------------------------------
     # PANEL SIZING (Override in subclasses to customize layout)
@@ -877,6 +1257,19 @@ class Screen:
 # START SCREEN
 # =============================================================================
 class StartScreen(Screen):
+    STATE_NORMAL = "normal"
+    STATE_UNKNOWN_PROMPT = "unknown_prompt"
+
+    def __init__(self, app):
+        super().__init__(app)
+        app.authenticated_admin = None
+        self.state = self.STATE_NORMAL
+        self.unknown_uid = None
+        self.unknown_prompt_time = None
+        self.last_activity = time.time()
+        self.idle_timeout = app.config.get('timing', {}).get('idle_timeout', 120)
+        self.unknown_tag_timeout = app.config.get('timing', {}).get('unknown_tag_timeout', 10)
+
     def get_panel_sizes(self, available_rows):
         """Default layout: 16 rows for leaderboard, rest for event log"""
         return {
@@ -885,29 +1278,68 @@ class StartScreen(Screen):
         }
 
     def handle(self, key, uid):
+        if key or uid:
+            self.last_activity = time.time()
+
+        # Handle unknown tag prompt state
+        if self.state == self.STATE_UNKNOWN_PROMPT:
+            if self.unknown_prompt_time and time.time() - self.unknown_prompt_time > self.unknown_tag_timeout:
+                self.app.log_event("TIMEOUT", details="Unregistered badge prompt timed out")
+                self.state = self.STATE_NORMAL
+                self.unknown_uid = None
+                self.unknown_prompt_time = None
+                self.app.tui.force_full_redraw()
+                return
+            if uid:
+                # A badge scan during prompt — handle normally
+                if self.app.db.admin_exists(uid):
+                    self.app.switch_screen(AdminScreen(self.app, uid))
+                    return
+                elif self.app.db.hunter_exists(uid):
+                    self.app.beep("hunter_id")
+                    self.app.switch_screen(ScanWuzuScreen(self.app, uid))
+                    return
+            if key in ["y", "\r"]:
+                self.app.switch_screen(AddHunterScreen(self.app, uid=self.unknown_uid))
+                return
+            elif key in ["n", "x"]:
+                self.app.log_event("UNKNOWN", details="Unregistered badge scanned")
+                self.state = self.STATE_NORMAL
+                self.unknown_uid = None
+                self.unknown_prompt_time = None
+                self.app.tui.force_full_redraw()
+                return
+            return
+
         if key == "a":
             self.app.switch_screen(AddHunterScreen(self.app))
-        elif key == "w":
-            self.app.switch_screen(AddWuzuScreen(self.app))
-        elif key == "q":
-            sys.exit()
         elif key == "r":
             self.app.tui.force_full_redraw()
         elif uid:
-            if self.app.db.hunter_exists(uid):
+            if self.app.db.admin_exists(uid):
+                self.app.switch_screen(AdminScreen(self.app, uid))
+                return
+            elif self.app.db.hunter_exists(uid):
                 self.app.beep("hunter_id")
                 self.app.switch_screen(ScanWuzuScreen(self.app, uid))
             else:
-                self.app.log_event("UNKNOWN", details=f"Unregistered badge {uid}")
+                self.unknown_uid = uid
+                self.unknown_prompt_time = time.time()
+                self.state = self.STATE_UNKNOWN_PROMPT
+                self.app.tui.force_full_redraw()
+
+        # Check idle timeout for screen saver
+        if time.time() - self.last_activity > self.idle_timeout:
+            self.app.switch_screen(ScreenSaverScreen(self.app))
 
     def render_main(self, bounded, app_state):
         """Render top hunters leaderboard"""
         bounded.set_title("TOP HUNTERS")
         
         # Header row
-        header = f"{'RANK':<5} {'NAME':<20} {'PTS':<6} {'UID':<14} {'LAST SEEN':<10}"
+        header = f"{'RANK':<5} {'NAME':<20} {'PTS':<6} {'LAST SEEN':<10}"
         bounded.print_content(1, header)
-        bounded.print_content(2, "-" * 60)
+        bounded.print_content(2, "-" * 45)
 
         # Query hunters
         hunters = self.app.db.get_top_hunters(10)
@@ -915,7 +1347,8 @@ class StartScreen(Screen):
         for i, hunter in enumerate(hunters, start=1):
             last = hunter.get("last_seen")
             age = format_ago(last.timestamp()) if last else "--"
-            row = f"{i:02} {hunter['name']:<20} {hunter['points']:<6} {hunter['uid']:<14} {age:<10}"
+            rank = f"{i:02d}"
+            row = f"{rank:<5} {hunter['name']:<20} {hunter['points']:<6} {age:<10}"
             bounded.print_content(2 + i, row)
 
     def render_secondary(self, bounded, app_state):
@@ -928,14 +1361,91 @@ class StartScreen(Screen):
 
         for i, evt in enumerate(events, start=1):
             ts = evt['timestamp'].strftime("%H:%M:%S")
-            line = f"{ts} {evt['event_type']:<8} {evt['details']}"
+            line = f"{ts} {evt['event_type']:<10} {evt['details']}"
             bounded.print_content(i, line[:content_cols])
 
     def render_footer(self, bounded, app_state):
         """Render operator controls"""
         bounded.set_title("OPERATOR PANEL")
-        bounded.print_content(1, "[A] Add Hunter  [W] Add Wuzu  [Q] Quit  [R] Redraw Screen")
-        bounded.print_content(2, "Scan hunter badge to begin scoring...")
+        if self.state == self.STATE_UNKNOWN_PROMPT:
+            bounded.print_content(1, f"Unregistered tag detected: {self.unknown_uid}")
+            bounded.print_content(2, "Add new hunter? [Y/n]")
+        else:
+            bounded.print_content(1, "[A] Add Hunter  [R] Redraw Screen")
+            bounded.print_content(2, "Scan hunter badge to begin scoring...")
+
+
+# =============================================================================
+# SCREEN SAVER SCREEN
+# =============================================================================
+class ScreenSaverScreen(Screen):
+    def __init__(self, app):
+        super().__init__(app)
+        self.interval = app.config.get('timing', {}).get('screensaver_interval', 5)
+        self.last_move = 0  # Force immediate reposition on first render
+        self.text_x = 0
+        self.text_y = 0
+        self.prompt_text = "Scan Hunter Tag To Begin ------>"
+
+    def use_borders(self):
+        return False
+
+    def get_panel_sizes(self, available_rows):
+        return {'main': available_rows, 'secondary': None}
+
+    def handle(self, key, uid):
+        if uid:
+            # Check admin first — admins never score
+            if self.app.db.admin_exists(uid):
+                self.app.switch_screen(AdminScreen(self.app, uid))
+                return
+            elif self.app.db.hunter_exists(uid):
+                self.app.beep("hunter_id")
+                self.app.switch_screen(ScanWuzuScreen(self.app, uid))
+                return
+            else:
+                start = StartScreen(self.app)
+                start.unknown_uid = uid
+                start.state = StartScreen.STATE_UNKNOWN_PROMPT
+                self.app.switch_screen(start)
+                return
+
+        if key:
+            # Any key press returns to main screen
+            self.app.switch_screen(StartScreen(self.app))
+            return
+
+        # Move text periodically
+        now = time.time()
+        if now - self.last_move >= self.interval:
+            self._reposition()
+            self.last_move = now
+            self.app.tui.force_full_redraw()
+
+    def _reposition(self):
+        cols, rows = self.app.terminal.size()
+        text_len = len(self.prompt_text)
+        # Bound to middle ~60% of screen
+        margin_x = cols // 5
+        margin_y = rows // 5
+        max_x = cols - margin_x - text_len - 1
+        max_y = rows - margin_y
+        self.text_x = random.randint(margin_x, max(margin_x, max_x))
+        self.text_y = random.randint(margin_y, max(margin_y, max_y))
+
+    def render_title_bar(self, bounded):
+        pass
+
+    def render_status_bar(self, bounded, app_state):
+        pass
+
+    def render_footer(self, bounded, app_state):
+        pass
+
+    def render_main(self, bounded, app_state):
+        # Position the floating text directly on the terminal
+        self.app.terminal.move_to(self.text_y, self.text_x)
+        print(self.prompt_text, end="")
 
 
 # =============================================================================
@@ -947,10 +1457,14 @@ class AddHunterScreen(Screen):
     STATE_CONFIRM = "confirm"
     STATE_ERROR = "error"
 
-    def __init__(self, app):
+    def __init__(self, app, uid=None):
         super().__init__(app)
-        self.state = self.STATE_SCAN
-        self.uid = None
+        if uid:
+            self.uid = uid
+            self.state = self.STATE_NAME
+        else:
+            self.uid = None
+            self.state = self.STATE_SCAN
         self.name_input = ""
         self.error_msg = ""
 
@@ -958,7 +1472,7 @@ class AddHunterScreen(Screen):
         """This screen wants all space for the form, no secondary panel"""
         return {
             'main': available_rows,
-            'secondary': 0
+            'secondary': None
         }
 
     def handle(self, key, uid):
@@ -968,9 +1482,12 @@ class AddHunterScreen(Screen):
                 self.app.switch_screen(StartScreen(self.app))
                 return            
             if uid:
-                if self.app.db.hunter_exists(uid):
-                    self.app.log_event("DUPLICATE", details=f"Hunter {uid} already registered")
-                    self.error_msg = f"UID {uid} already registered!"
+                if self.app.db.admin_exists(uid):
+                    self.error_msg = "This badge is registered as an admin!"
+                    self.state = self.STATE_ERROR
+                elif self.app.db.hunter_exists(uid):
+                    self.app.log_event("DUPLICATE", details="Hunter badge already registered")
+                    self.error_msg = "This badge is already registered!"
                     self.state = self.STATE_ERROR
                 else:
                     self.uid = uid
@@ -1050,36 +1567,684 @@ class AddHunterScreen(Screen):
 
 
 # =============================================================================
+# ADMIN SCREEN
+# =============================================================================
+class AdminScreen(Screen):
+    STATE_PASSWORD = "password"
+    STATE_MENU = "menu"
+    STATE_HUNTER_HISTORY = "hunter_history"
+    STATE_DELETE_CONFIRM = "delete_confirm"
+    STATE_ADJUST_SCORE = "adjust_score"
+    STATE_ADD_ADMIN_SCAN = "add_admin_scan"
+    STATE_ADD_ADMIN_NAME = "add_admin_name"
+    STATE_ADD_ADMIN_PASSWORD = "add_admin_password"
+    STATE_EDIT_WUZU_SCAN = "edit_wuzu_scan"
+    STATE_EDIT_WUZU_MENU = "edit_wuzu_menu"
+    STATE_EDIT_WUZU_NAME = "edit_wuzu_name"
+    STATE_EDIT_WUZU_POINTS = "edit_wuzu_points"
+    STATE_EDIT_WUZU_FACT = "edit_wuzu_fact"
+    STATE_DELETE_WUZU_CONFIRM = "delete_wuzu_confirm"
+    STATE_QUIT_CONFIRM = "quit_confirm"
+
+    def __init__(self, app, admin_uid):
+        super().__init__(app)
+        self.admin_uid = admin_uid
+        self.admin = app.db.get_admin(admin_uid)
+        if app.authenticated_admin == admin_uid:
+            self.state = self.STATE_MENU
+        else:
+            self.state = self.STATE_PASSWORD
+        self.password_input = ""
+        # Hunter history state
+        self.history_hunter_uid = None
+        self.history_hunter = None
+        self.history_events = []
+        self.selected_index = 0
+        self.scroll_offset = 0
+        # Delete confirm state
+        self.delete_event = None
+        # Adjust score state
+        self.adjust_input = ""
+        # Add admin state
+        self.new_admin_uid = None
+        self.new_admin_name = ""
+        self.new_admin_password = ""
+        self.add_admin_error = ""
+        # Edit wuzu state
+        self.edit_wuzu = None
+        self.edit_wuzu_input = ""
+        self.edit_wuzu_error = ""
+        self.edit_wuzu_scan_start = 0
+        # Idle timeout
+        self.last_activity = time.time()
+        self.admin_timeout = app.config.get('timing', {}).get('admin_timeout', 30)
+
+    def get_panel_sizes(self, available_rows):
+        return {
+            'main': 16,
+            'secondary': available_rows - 16
+        }
+
+    def handle(self, key, uid):
+        if key or uid:
+            self.last_activity = time.time()
+
+        # Check idle timeout
+        if self.state != self.STATE_PASSWORD and time.time() - self.last_activity > self.admin_timeout:
+            self.app.switch_screen(StartScreen(self.app))
+            return
+
+        if self.state == self.STATE_PASSWORD:
+            self._handle_password(key)
+        elif self.state == self.STATE_MENU:
+            self._handle_menu(key, uid)
+        elif self.state == self.STATE_HUNTER_HISTORY:
+            self._handle_hunter_history(key, uid)
+        elif self.state == self.STATE_DELETE_CONFIRM:
+            self._handle_delete_confirm(key)
+        elif self.state == self.STATE_ADJUST_SCORE:
+            self._handle_adjust_score(key)
+        elif self.state == self.STATE_ADD_ADMIN_SCAN:
+            self._handle_add_admin_scan(key, uid)
+        elif self.state == self.STATE_ADD_ADMIN_NAME:
+            self._handle_add_admin_name(key)
+        elif self.state == self.STATE_ADD_ADMIN_PASSWORD:
+            self._handle_add_admin_password(key)
+        elif self.state == self.STATE_EDIT_WUZU_SCAN:
+            self._handle_edit_wuzu_scan(key)
+        elif self.state == self.STATE_EDIT_WUZU_MENU:
+            self._handle_edit_wuzu_menu(key)
+        elif self.state == self.STATE_EDIT_WUZU_NAME:
+            self._handle_edit_wuzu_input(key, "name")
+        elif self.state == self.STATE_EDIT_WUZU_POINTS:
+            self._handle_edit_wuzu_input(key, "points")
+        elif self.state == self.STATE_EDIT_WUZU_FACT:
+            self._handle_edit_wuzu_input(key, "fact")
+        elif self.state == self.STATE_DELETE_WUZU_CONFIRM:
+            self._handle_delete_wuzu_confirm(key)
+        elif self.state == self.STATE_QUIT_CONFIRM:
+            self._handle_quit_confirm(key)
+
+    def _handle_password(self, key):
+        if key == "x":
+            self.app.switch_screen(StartScreen(self.app))
+        elif key == "\r":
+            if self.app.db.verify_admin_password(self.admin_uid, self.password_input):
+                self.password_input = ""
+                self.state = self.STATE_MENU
+                self.app.authenticated_admin = self.admin_uid
+                self.app.tui.force_full_redraw()
+            else:
+                # Log failed password attempt as private event
+                admin_name = self.admin.get('name', self.admin_uid) if self.admin else self.admin_uid
+                self.app.db.log_system_event("ADMIN_PASSWORD_FAIL",
+                    admin_uid=self.admin_uid,
+                    details=f"Failed password attempt for admin '{admin_name}'",
+                    private=True)
+                self.password_input = ""
+                self.app.switch_screen(StartScreen(self.app))
+        elif key == "\x7f" or key == "\x08":
+            self.password_input = self.password_input[:-1]
+            self.app.tui.mark_dirty(PANEL_MAIN)
+        elif key and len(key) == 1 and key.isprintable():
+            self.password_input += key
+            self.app.tui.mark_dirty(PANEL_MAIN)
+
+    def _handle_menu(self, key, uid):
+        if key == "w":
+            self.app.switch_screen(AddWuzuScreen(self.app,
+                on_return=lambda: AdminScreen(self.app, self.admin_uid)))
+        elif key == "q":
+            self.state = self.STATE_QUIT_CONFIRM
+            self.app.tui.force_full_redraw()
+        elif key == "e":
+            self.edit_wuzu = None
+            self.edit_wuzu_input = ""
+            self.edit_wuzu_error = ""
+            self.edit_wuzu_scan_start = time.time()
+            self.state = self.STATE_EDIT_WUZU_SCAN
+            self.app.tui.force_full_redraw()
+        elif key == "a":
+            self.state = self.STATE_ADD_ADMIN_SCAN
+            self.new_admin_uid = None
+            self.new_admin_name = ""
+            self.app.tui.force_full_redraw()
+        elif key == "x":
+            self.app.switch_screen(StartScreen(self.app))
+        elif uid:
+            # Hunter badge scanned — show their history
+            if self.app.db.hunter_exists(uid):
+                self.history_hunter_uid = uid
+                self.history_hunter = self.app.db.get_hunter(uid)
+                self.history_events = self.app.db.get_hunter_scan_history(uid)
+                self.selected_index = 0
+                self.scroll_offset = 0
+                self.state = self.STATE_HUNTER_HISTORY
+                self.app.tui.force_full_redraw()
+
+    def _handle_quit_confirm(self, key):
+        if key == "y" or key == "\r":
+            self.app.db.log_system_event("SYSTEM_QUIT", admin_uid=self.admin_uid,
+                details=f"Quit by admin {self.admin.get('name', self.admin_uid) if self.admin else self.admin_uid}")
+            self.app.terminal.clear()
+            self.app.db.close()
+            sys.exit()
+        elif key and key != "y":
+            self.state = self.STATE_MENU
+            self.app.tui.force_full_redraw()
+
+    def _handle_hunter_history(self, key, uid):
+        if key == "x":
+            self.state = self.STATE_MENU
+            self.app.tui.force_full_redraw()
+        elif key == "d":
+            # Delete selected event
+            if self.history_events and 0 <= self.selected_index < len(self.history_events):
+                evt = self.history_events[self.selected_index]
+                if not evt.get('deleted') and evt.get('event_type') == 'SCORE':
+                    self.delete_event = evt
+                    self.state = self.STATE_DELETE_CONFIRM
+                    self.app.tui.force_full_redraw()
+        elif key == "m":
+            self.adjust_input = ""
+            self.state = self.STATE_ADJUST_SCORE
+            self.app.tui.force_full_redraw()
+        elif key in ("j", "2"):
+            # Move selection down
+            if self.selected_index < len(self.history_events) - 1:
+                self.selected_index += 1
+                self.app.tui.mark_dirty(PANEL_MAIN)
+        elif key in ("k", "8"):
+            # Move selection up
+            if self.selected_index > 0:
+                self.selected_index -= 1
+                self.app.tui.mark_dirty(PANEL_MAIN)
+
+    def _handle_delete_confirm(self, key):
+        if key == "y":
+            if self.delete_event:
+                self.app.db.soft_delete_event(self.delete_event['id'], self.admin_uid)
+                # Refresh history
+                self.history_events = self.app.db.get_hunter_scan_history(self.history_hunter_uid)
+                self.history_hunter = self.app.db.get_hunter(self.history_hunter_uid)
+                if self.selected_index >= len(self.history_events):
+                    self.selected_index = max(0, len(self.history_events) - 1)
+            self.delete_event = None
+            self.state = self.STATE_HUNTER_HISTORY
+            self.app.tui.force_full_redraw()
+        elif key == "n":
+            self.delete_event = None
+            self.state = self.STATE_HUNTER_HISTORY
+            self.app.tui.force_full_redraw()
+
+    def _handle_adjust_score(self, key):
+        if key == "x":
+            self.state = self.STATE_HUNTER_HISTORY
+            self.app.tui.force_full_redraw()
+        elif key == "\r":
+            # Enter — apply adjustment
+            try:
+                points = int(self.adjust_input)
+                if points != 0:
+                    self.app.db.admin_adjust_score(
+                        self.history_hunter_uid, points, self.admin_uid)
+                    # Refresh history and hunter data
+                    self.history_events = self.app.db.get_hunter_scan_history(self.history_hunter_uid)
+                    self.history_hunter = self.app.db.get_hunter(self.history_hunter_uid)
+            except ValueError:
+                pass
+            self.state = self.STATE_HUNTER_HISTORY
+            self.app.tui.force_full_redraw()
+        elif key == "\x7f" or key == "\x08":
+            # Backspace
+            self.adjust_input = self.adjust_input[:-1]
+            self.app.tui.mark_dirty(PANEL_MAIN)
+        elif key and (key.isdigit() or (key == "-" and len(self.adjust_input) == 0)):
+            self.adjust_input += key
+            self.app.tui.mark_dirty(PANEL_MAIN)
+
+    def _handle_add_admin_scan(self, key, uid):
+        if key == "x":
+            self.state = self.STATE_MENU
+            self.app.tui.force_full_redraw()
+        elif uid:
+            if self.app.db.admin_exists(uid):
+                self.add_admin_error = "UID is already registered as an admin!"
+                self.app.tui.mark_dirty(PANEL_MAIN)
+                return
+            if self.app.db.hunter_exists(uid):
+                self.add_admin_error = "UID is registered as a hunter!"
+                self.app.tui.mark_dirty(PANEL_MAIN)
+                return
+            self.add_admin_error = ""
+            self.new_admin_uid = uid
+            self.new_admin_name = ""
+            self.state = self.STATE_ADD_ADMIN_NAME
+            self.app.tui.force_full_redraw()
+
+    def _handle_add_admin_name(self, key):
+        if key == "x":
+            self.state = self.STATE_MENU
+            self.app.tui.force_full_redraw()
+        elif key == "\r":
+            # Enter — confirm name, move to password creation
+            name = self.new_admin_name.strip()
+            if len(name) >= 2 and not self.app.db.admin_name_exists(name):
+                self.new_admin_password = ""
+                self.state = self.STATE_ADD_ADMIN_PASSWORD
+                self.app.tui.force_full_redraw()
+            else:
+                self.app.tui.mark_dirty(PANEL_MAIN)
+        elif key == "\x7f" or key == "\x08":
+            # Backspace
+            self.new_admin_name = self.new_admin_name[:-1]
+            self.app.tui.mark_dirty(PANEL_MAIN)
+        elif key and (key.isalnum() or key in " -"):
+            if len(self.new_admin_name) < 20:
+                self.new_admin_name += key
+                self.app.tui.mark_dirty(PANEL_MAIN)
+
+    def _handle_add_admin_password(self, key):
+        if key == "x":
+            self.state = self.STATE_MENU
+            self.app.tui.force_full_redraw()
+        elif key == "\r":
+            # Enter — password can't be blank
+            if self.new_admin_password:
+                name = self.new_admin_name.strip()
+                self.app.db.add_admin(self.new_admin_uid, name,
+                    self.new_admin_password, self.admin_uid)
+                self.app.db.log_system_event("ADMIN_ADD", admin_uid=self.admin_uid,
+                    details=f"Added admin '{name}' UID {self.new_admin_uid}")
+                self.new_admin_password = ""
+                self.state = self.STATE_MENU
+                self.app.tui.force_full_redraw()
+            else:
+                self.app.tui.mark_dirty(PANEL_MAIN)
+        elif key == "\x7f" or key == "\x08":
+            self.new_admin_password = self.new_admin_password[:-1]
+            self.app.tui.mark_dirty(PANEL_MAIN)
+        elif key and len(key) == 1 and key.isprintable():
+            self.new_admin_password += key
+            self.app.tui.mark_dirty(PANEL_MAIN)
+
+    def _handle_edit_wuzu_scan(self, key):
+        if key == "x":
+            self.state = self.STATE_MENU
+            self.app.tui.force_full_redraw()
+            return
+
+        timeout = self.app.config.get('timing', {}).get('scan_timeout', 10)
+        if time.time() - self.edit_wuzu_scan_start > timeout:
+            self.state = self.STATE_MENU
+            self.app.tui.force_full_redraw()
+            return
+
+        tags = self.app.uhf.inventory()
+        if tags:
+            epc = tags[0]["epc"]
+            self.app.beep("new_wuzu")
+            wuzu = self.app.db.get_wuzu(epc)
+            if wuzu and not wuzu.get('deleted'):
+                self.edit_wuzu = wuzu
+                self.edit_wuzu_error = ""
+                self.state = self.STATE_EDIT_WUZU_MENU
+                self.app.tui.force_full_redraw()
+            elif wuzu and wuzu.get('deleted'):
+                wuzu_name = wuzu.get('name') or epc
+                self.edit_wuzu_error = f"Deleted wuzu '{wuzu_name}' — re-add it first!"
+                self.app.tui.mark_dirty(PANEL_MAIN)
+            else:
+                self.edit_wuzu_error = f"Wuzu {epc} not found in database!"
+                self.app.tui.mark_dirty(PANEL_MAIN)
+        else:
+            self.app.tui.mark_dirty(PANEL_FOOTER)
+
+    def _handle_edit_wuzu_menu(self, key):
+        if key == "x":
+            self.state = self.STATE_MENU
+            self.app.tui.force_full_redraw()
+        elif key == "n":
+            self.edit_wuzu_input = self.edit_wuzu.get('name') or ""
+            self.state = self.STATE_EDIT_WUZU_NAME
+            self.app.tui.force_full_redraw()
+        elif key == "p":
+            default_points = self.app.config.get('scoring', {}).get('default_points', 10)
+            self.edit_wuzu_input = str(self.edit_wuzu.get('points_value', default_points))
+            self.state = self.STATE_EDIT_WUZU_POINTS
+            self.app.tui.force_full_redraw()
+        elif key == "f":
+            self.edit_wuzu_input = self.edit_wuzu.get('fact') or ""
+            self.state = self.STATE_EDIT_WUZU_FACT
+            self.app.tui.force_full_redraw()
+        elif key == "d":
+            self.state = self.STATE_DELETE_WUZU_CONFIRM
+            self.app.tui.force_full_redraw()
+
+    def _handle_delete_wuzu_confirm(self, key):
+        if key == "y":
+            epc = self.edit_wuzu['epc']
+            wuzu_name = self.edit_wuzu.get('name') or epc
+            self.app.db.soft_delete_wuzu(epc)
+            self.app.db.log_system_event("ADMIN_DELETE",
+                admin_uid=self.admin_uid,
+                details=f"Deleted wuzu '{wuzu_name}' ({epc})",
+                private=True)
+            self.state = self.STATE_MENU
+            self.app.tui.force_full_redraw()
+        elif key in ["n", "x"]:
+            self.state = self.STATE_EDIT_WUZU_MENU
+            self.app.tui.force_full_redraw()
+
+    def _handle_edit_wuzu_input(self, key, field):
+        if key == "x":
+            self.state = self.STATE_EDIT_WUZU_MENU
+            self.app.tui.force_full_redraw()
+        elif key == "\r":
+            epc = self.edit_wuzu['epc']
+            value = self.edit_wuzu_input.strip()
+            if field == "name":
+                self.app.db.update_wuzu(epc, name=value if value else None)
+            elif field == "points":
+                try:
+                    pts = int(value)
+                    if pts > 0:
+                        self.app.db.update_wuzu(epc, points_value=pts)
+                except ValueError:
+                    pass
+            elif field == "fact":
+                self.app.db.update_wuzu(epc, fact=value if value else None)
+            # Refresh wuzu data
+            self.edit_wuzu = self.app.db.get_wuzu(epc)
+            self.state = self.STATE_EDIT_WUZU_MENU
+            self.app.tui.force_full_redraw()
+        elif key == "\x7f" or key == "\x08":
+            self.edit_wuzu_input = self.edit_wuzu_input[:-1]
+            self.app.tui.mark_dirty(PANEL_MAIN)
+        elif key and len(key) == 1 and key.isprintable():
+            max_len = 200 if field == "fact" else 100 if field == "name" else 10
+            if len(self.edit_wuzu_input) < max_len:
+                if field == "points":
+                    if key.isdigit():
+                        self.edit_wuzu_input += key
+                        self.app.tui.mark_dirty(PANEL_MAIN)
+                else:
+                    self.edit_wuzu_input += key
+                    self.app.tui.mark_dirty(PANEL_MAIN)
+
+    # === RENDERING ===
+    def render_main(self, bounded, app_state):
+        if self.state == self.STATE_PASSWORD:
+            self._render_password(bounded)
+        elif self.state == self.STATE_MENU:
+            self._render_menu(bounded)
+        elif self.state == self.STATE_HUNTER_HISTORY:
+            self._render_hunter_history(bounded)
+        elif self.state == self.STATE_DELETE_CONFIRM:
+            self._render_delete_confirm(bounded)
+        elif self.state == self.STATE_ADJUST_SCORE:
+            self._render_adjust_score(bounded)
+        elif self.state == self.STATE_ADD_ADMIN_SCAN:
+            self._render_add_admin_scan(bounded)
+        elif self.state == self.STATE_ADD_ADMIN_NAME:
+            self._render_add_admin_name(bounded)
+        elif self.state == self.STATE_ADD_ADMIN_PASSWORD:
+            self._render_add_admin_password(bounded)
+        elif self.state == self.STATE_EDIT_WUZU_SCAN:
+            self._render_edit_wuzu_scan(bounded)
+        elif self.state == self.STATE_EDIT_WUZU_MENU:
+            self._render_edit_wuzu_menu(bounded)
+        elif self.state in (self.STATE_EDIT_WUZU_NAME, self.STATE_EDIT_WUZU_POINTS, self.STATE_EDIT_WUZU_FACT):
+            self._render_edit_wuzu_input(bounded)
+        elif self.state == self.STATE_DELETE_WUZU_CONFIRM:
+            self._render_delete_wuzu_confirm(bounded)
+        elif self.state == self.STATE_QUIT_CONFIRM:
+            self._render_quit_confirm(bounded)
+
+    def _render_password(self, bounded):
+        admin_name = self.admin.get('name', self.admin_uid) if self.admin else self.admin_uid
+        bounded.set_title("ADMIN LOGIN")
+        content_cols, content_rows = bounded.content_size()
+        start_row = (content_rows - 6) // 2 + 1
+
+        bounded.print_centered(start_row, f"Admin: {admin_name}")
+        bounded.print_centered(start_row + 2, "Enter password:")
+        masked = "*" * len(self.password_input)
+        bounded.print_centered(start_row + 3, f"> {masked}_")
+        bounded.print_centered(start_row + 5, "[Enter] Submit    [X] Cancel")
+
+    def _render_menu(self, bounded):
+        admin_name = self.admin.get('name', self.admin_uid) if self.admin else self.admin_uid
+        bounded.set_title(f"ADMIN PANEL - {admin_name}")
+        content_cols, content_rows = bounded.content_size()
+        start_row = (content_rows - 8) // 2 + 1
+
+        bounded.print_centered(start_row, "ADMIN FUNCTIONS")
+        bounded.print_centered(start_row + 2, "[W] Add Wuzu Tag       [E] Edit Wuzu")
+        bounded.print_centered(start_row + 3, "[A] Add New Admin")
+        bounded.print_centered(start_row + 4, "[Q] Quit Application   [X] Exit Admin Mode")
+        bounded.print_centered(start_row + 6, "Scan hunter badge to view/edit history...")
+
+    def _render_quit_confirm(self, bounded):
+        bounded.set_title("QUIT APPLICATION")
+        content_cols, content_rows = bounded.content_size()
+        start_row = (content_rows - 4) // 2 + 1
+        bounded.print_centered(start_row, "Quit application, Are you sure?")
+        bounded.print_centered(start_row + 2, "[Y/n]")
+
+    def _render_hunter_history(self, bounded):
+        hunter_name = self.history_hunter.get('name', '?') if self.history_hunter else '?'
+        hunter_pts = self.history_hunter.get('points', 0) if self.history_hunter else 0
+        bounded.set_title(f"HUNTER: {hunter_name} ({hunter_pts}pts)")
+
+        content_cols, content_rows = bounded.content_size()
+
+        # Header
+        header = f"{'#':<4} {'TIME':<10} {'TYPE':<12} {'PTS':<6} {'DETAILS':<30} {'STATUS'}"
+        bounded.print_content(1, header)
+        bounded.print_content(2, "-" * min(content_cols, 80))
+
+        # Visible rows
+        visible_rows = content_rows - 4
+        # Adjust scroll to keep selection visible
+        if self.selected_index < self.scroll_offset:
+            self.scroll_offset = self.selected_index
+        elif self.selected_index >= self.scroll_offset + visible_rows:
+            self.scroll_offset = self.selected_index - visible_rows + 1
+
+        for i, evt in enumerate(self.history_events[self.scroll_offset:self.scroll_offset + visible_rows]):
+            actual_idx = self.scroll_offset + i
+            ts = evt['timestamp'].strftime("%H:%M:%S")
+            pts = evt.get('points_awarded', 0)
+            details = (evt.get('details', '') or '')[:30]
+            status = "[DELETED]" if evt.get('deleted') else ""
+            marker = "> " if actual_idx == self.selected_index else "  "
+            row = f"{marker}{actual_idx + 1:<2} {ts:<10} {evt['event_type']:<12} {pts:<6} {details:<30} {status}"
+            bounded.print_content(3 + i, row[:content_cols])
+
+    def _render_delete_confirm(self, bounded):
+        bounded.set_title("CONFIRM DELETE")
+        content_cols, content_rows = bounded.content_size()
+        start_row = (content_rows - 6) // 2 + 1
+
+        if self.delete_event:
+            ts = self.delete_event['timestamp'].strftime("%H:%M:%S")
+            pts = self.delete_event.get('points_awarded', 0)
+            details = self.delete_event.get('details', '') or ''
+            bounded.print_centered(start_row, f"Event: {ts} - {details}")
+            bounded.print_centered(start_row + 1, f"Points: {pts}")
+            bounded.print_centered(start_row + 3, "Delete this event and remove points?")
+            bounded.print_centered(start_row + 5, "[Y] Yes    [N] No")
+
+    def _render_adjust_score(self, bounded):
+        bounded.set_title("MANUAL SCORE ADJUSTMENT")
+        content_cols, content_rows = bounded.content_size()
+        start_row = (content_rows - 6) // 2 + 1
+
+        hunter_name = self.history_hunter.get('name', '?') if self.history_hunter else '?'
+        bounded.print_centered(start_row, f"Hunter: {hunter_name}")
+        bounded.print_centered(start_row + 2, "Enter point adjustment (e.g. 10 or -5):")
+        bounded.print_centered(start_row + 3, f"> {self.adjust_input}_")
+        bounded.print_centered(start_row + 5, "[Enter] Apply    [X] Cancel")
+
+    def _render_add_admin_scan(self, bounded):
+        bounded.set_title("ADD NEW ADMIN")
+        content_cols, content_rows = bounded.content_size()
+        start_row = (content_rows - 6) // 2 + 1
+
+        bounded.print_centered(start_row, "Scan NFC badge of new admin...")
+        if self.add_admin_error:
+            bounded.print_centered(start_row + 2, f"ERROR: {self.add_admin_error}")
+        bounded.print_centered(start_row + 4, "[X] Cancel")
+
+    def _render_add_admin_name(self, bounded):
+        bounded.set_title("ADD NEW ADMIN")
+        content_cols, content_rows = bounded.content_size()
+        start_row = (content_rows - 6) // 2 + 1
+
+        bounded.print_centered(start_row, f"Badge UID: {self.new_admin_uid}")
+        bounded.print_centered(start_row + 2, "Enter admin name:")
+        bounded.print_centered(start_row + 3, f"> {self.new_admin_name}_")
+        bounded.print_centered(start_row + 5, "[Enter] Confirm    [X] Cancel")
+
+    def _render_add_admin_password(self, bounded):
+        bounded.set_title("ADD NEW ADMIN - SET PASSWORD")
+        content_cols, content_rows = bounded.content_size()
+        start_row = (content_rows - 6) // 2 + 1
+
+        bounded.print_centered(start_row, f"Admin: {self.new_admin_name.strip()}")
+        bounded.print_centered(start_row + 2, "Create a password (cannot be blank):")
+        masked = "*" * len(self.new_admin_password) if hasattr(self, 'new_admin_password') else ""
+        bounded.print_centered(start_row + 3, f"> {masked}_")
+        bounded.print_centered(start_row + 5, "[Enter] Confirm    [X] Cancel")
+
+    def _render_edit_wuzu_scan(self, bounded):
+        bounded.set_title("EDIT WUZU")
+        content_cols, content_rows = bounded.content_size()
+        start_row = (content_rows - 6) // 2 + 1
+
+        timeout = self.app.config.get('timing', {}).get('scan_timeout', 10)
+        left = max(0, int(timeout - (time.time() - self.edit_wuzu_scan_start)))
+        bounded.print_centered(start_row, "Scan Wuzu tag with UHF reader...")
+        bounded.print_centered(start_row + 2, f"Timeout in {left} seconds")
+        if self.edit_wuzu_error:
+            bounded.print_centered(start_row + 4, f"ERROR: {self.edit_wuzu_error}")
+
+    def _render_edit_wuzu_menu(self, bounded):
+        bounded.set_title("EDIT WUZU")
+
+        wuzu = self.edit_wuzu
+        status = " [DELETED]" if wuzu.get('deleted') else ""
+        bounded.print_content(1, f"EPC:    {wuzu['epc']}{status}")
+        bounded.print_content(2, f"Name:   {wuzu.get('name') or '(none)'}")
+        default_points = self.app.config.get('scoring', {}).get('default_points', 10)
+        bounded.print_content(3, f"Points: {wuzu.get('points_value', default_points)}")
+        bounded.print_content(4, f"Fact:   {wuzu.get('fact') or '(none)'}")
+        bounded.print_content(5, f"Found:  {wuzu.get('times_found', 0)} times")
+        bounded.print_content(7, "[N] Edit Name   [P] Edit Points   [F] Edit Fact   [D] Delete")
+        bounded.print_content(8, "[X] Back to Admin Menu")
+
+    def _render_delete_wuzu_confirm(self, bounded):
+        bounded.set_title("CONFIRM DELETE WUZU")
+        content_cols, content_rows = bounded.content_size()
+        start_row = (content_rows - 6) // 2 + 1
+
+        wuzu_name = self.edit_wuzu.get('name') or self.edit_wuzu['epc']
+        bounded.print_centered(start_row, f"Wuzu: {wuzu_name}")
+        bounded.print_centered(start_row + 1, f"EPC: {self.edit_wuzu['epc']}")
+        bounded.print_centered(start_row + 3, "Delete this wuzu? It will no longer award points.")
+        bounded.print_centered(start_row + 5, "[Y] Yes    [N] No")
+
+    def _render_edit_wuzu_input(self, bounded):
+        if self.state == self.STATE_EDIT_WUZU_NAME:
+            field_label = "Name"
+        elif self.state == self.STATE_EDIT_WUZU_POINTS:
+            field_label = "Points"
+        else:
+            field_label = "Fact"
+
+        bounded.set_title(f"EDIT WUZU - {field_label.upper()}")
+        content_cols, content_rows = bounded.content_size()
+        start_row = (content_rows - 6) // 2 + 1
+
+        wuzu_name = self.edit_wuzu.get('name') or self.edit_wuzu['epc']
+        bounded.print_centered(start_row, f"Wuzu: {wuzu_name}")
+        bounded.print_centered(start_row + 2, f"Enter new {field_label.lower()}:")
+        bounded.print_centered(start_row + 3, f"> {self.edit_wuzu_input}_")
+        bounded.print_centered(start_row + 5, "[Enter] Save    [X] Cancel")
+
+    def render_secondary(self, bounded, app_state):
+        """Show all recent events"""
+        bounded.set_title("ALL EVENTS")
+        content_cols, content_rows = bounded.content_size()
+        events = self.app.db.get_all_recent_events(content_rows - 1)
+
+        for i, evt in enumerate(events, start=1):
+            ts = evt['timestamp'].strftime("%H:%M:%S")
+            prefix = "[DEL] " if evt.get('deleted') else ""
+            line = f"{ts} {evt['event_type']:<20} {prefix}{evt.get('details', '')}"
+            bounded.print_content(i, line[:content_cols])
+
+    def render_footer(self, bounded, app_state):
+        bounded.set_title("ADMIN CONTROLS")
+        if self.state == self.STATE_PASSWORD:
+            bounded.print_content(1, "[Enter] Submit  [X] Cancel")
+        elif self.state == self.STATE_MENU:
+            bounded.print_content(1, "[W] Add Wuzu  [E] Edit Wuzu  [A] Add Admin  [Q] Quit  [X] Exit")
+        elif self.state == self.STATE_HUNTER_HISTORY:
+            bounded.print_content(1, "[J/K] Navigate  [D] Delete Selected  [M] Manual Adjust  [X] Back")
+        elif self.state == self.STATE_DELETE_CONFIRM:
+            bounded.print_content(1, "[Y] Confirm Delete  [N] Cancel")
+        elif self.state == self.STATE_ADJUST_SCORE:
+            bounded.print_content(1, "[Enter] Apply  [X] Cancel")
+        elif self.state in (self.STATE_ADD_ADMIN_SCAN, self.STATE_ADD_ADMIN_NAME,
+                            self.STATE_ADD_ADMIN_PASSWORD):
+            bounded.print_content(1, "[X] Cancel")
+        elif self.state == self.STATE_EDIT_WUZU_SCAN:
+            bounded.print_content(1, "[X] Cancel")
+        elif self.state == self.STATE_EDIT_WUZU_MENU:
+            bounded.print_content(1, "[N] Name  [P] Points  [F] Fact  [D] Delete  [X] Back")
+        elif self.state in (self.STATE_EDIT_WUZU_NAME, self.STATE_EDIT_WUZU_POINTS,
+                            self.STATE_EDIT_WUZU_FACT):
+            bounded.print_content(1, "[Enter] Save  [X] Cancel")
+        elif self.state == self.STATE_DELETE_WUZU_CONFIRM:
+            bounded.print_content(1, "[Y] Confirm Delete  [N] Cancel")
+
+
+# =============================================================================
 # ADD WUZU SCREEN
 # =============================================================================
 class AddWuzuScreen(Screen):
     STATE_SCAN = "scan"
     STATE_ERROR = "error"
-    
-    def __init__(self, app):
+    STATE_READD_CONFIRM = "readd_confirm"
+
+    def __init__(self, app, on_return=None):
         super().__init__(app)
         self.state = self.STATE_SCAN
         self.timeout = app.config.get('timing', {}).get('scan_timeout', 10)
         self.start_time = time.time()
         self.error_msg = ""
+        self.readd_epc = None
+        self.on_return = on_return or (lambda: StartScreen(app))
 
     def get_panel_sizes(self, available_rows):
         """This screen wants all space for scanning status"""
         return {
             'main': available_rows,
-            'secondary': 0
+            'secondary': None
         }
 
     def handle(self, key, uid):
         if self.state == self.STATE_SCAN:
             if time.time() - self.start_time > self.timeout:
-                self.app.log_event("TIMEOUT", details="Add-Wuzu: no scan")
-                self.app.switch_screen(StartScreen(self.app))
+                self.app.log_event("TIMEOUT", details="Add-Wuzu: no scan", private=True)
+                self.app.switch_screen(self.on_return())
                 return
 
             if key == "x":
                 self.app.log_event("CANCEL", details="Add-Wuzu cancelled")
-                self.app.switch_screen(StartScreen(self.app))
+                self.app.switch_screen(self.on_return())
                 return
 
             tags = self.app.uhf.inventory()
@@ -1089,21 +2254,38 @@ class AddWuzuScreen(Screen):
                     self.app.beep("new_wuzu")
                     if not self.app.db.wuzu_exists(epc):
                         self.app.register_wuzu(epc)
-                        self.app.switch_screen(StartScreen(self.app))
+                        self.app.switch_screen(self.on_return())
+                        return
+                    elif self.app.db.wuzu_is_deleted(epc):
+                        self.readd_epc = epc
+                        self.state = self.STATE_READD_CONFIRM
+                        self.app.tui.force_full_redraw()
                         return
                     else:
-                        self.app.log_event("DUPLICATE", details=f"Wuzu {epc} already registered")
+                        self.app.log_event("DUPLICATE", details="Wuzu already registered")
                         self.error_msg = f"Wuzu {epc} already registered!"
                         self.state = self.STATE_ERROR
                         self.app.tui.force_full_redraw()
                         return
 
             self.app.tui.mark_dirty(PANEL_FOOTER)
-        
+
+        elif self.state == self.STATE_READD_CONFIRM:
+            if key in ["y", "\r"]:
+                self.app.db.restore_wuzu(self.readd_epc)
+                wuzu = self.app.db.get_wuzu(self.readd_epc)
+                wuzu_name = wuzu['name'] if wuzu and wuzu.get('name') else self.readd_epc
+                self.app.log_event("NEW", details=f"Wuzu '{wuzu_name}' re-added", private=True)
+                self.app.switch_screen(self.on_return())
+            elif key in ["n", "x"]:
+                self.state = self.STATE_SCAN
+                self.start_time = time.time()  # Reset timeout
+                self.app.tui.force_full_redraw()
+
         elif self.state == self.STATE_ERROR:
-            # Any key returns to start
+            # Any key returns
             if key:
-                self.app.switch_screen(StartScreen(self.app))
+                self.app.switch_screen(self.on_return())
 
     def render_main(self, bounded, app_state):
         """Show scanning status or error"""
@@ -1117,6 +2299,14 @@ class AddWuzuScreen(Screen):
             bounded.print_centered(start_row + 1, "Scanning for UHF tags...")
             bounded.print_centered(start_row + 3, f"Timeout in {left} seconds")
         
+        elif self.state == self.STATE_READD_CONFIRM:
+            bounded.set_title("ADD NEW WUZU")
+            wuzu = self.app.db.get_wuzu(self.readd_epc)
+            wuzu_name = wuzu['name'] if wuzu and wuzu.get('name') else self.readd_epc
+            bounded.print_centered(start_row + 1, f"Deleted wuzu detected: {wuzu_name}")
+            bounded.print_centered(start_row + 2, f"EPC: {self.readd_epc}")
+            bounded.print_centered(start_row + 4, "Re-add this wuzu? [Y/n]")
+
         elif self.state == self.STATE_ERROR:
             bounded.set_title("ADD NEW WUZU")
             bounded.print_centered(start_row + 1, "ERROR")
@@ -1125,10 +2315,12 @@ class AddWuzuScreen(Screen):
 
     def render_footer(self, bounded, app_state):
         bounded.set_title("ADD WUZU")
-        
+
         if self.state == self.STATE_SCAN:
             bounded.print_content(1, "Scan new Wuzu tag with UHF reader...")
             bounded.print_content(2, "[X] Cancel")
+        elif self.state == self.STATE_READD_CONFIRM:
+            bounded.print_content(1, "[Y] Re-add  [N] Cancel")
         else:
             bounded.print_content(1, "[X] Return to main screen")
 
@@ -1141,6 +2333,9 @@ class ScanWuzuScreen(Screen):
         super().__init__(app)
         self.hunter_uid = hunter_uid
         self.found = set()
+        self.unknown = set()
+        self.session_points = 0
+        self.rank_before = app.db.get_hunter_rank(hunter_uid)
         self.last_time = time.time()
         self.timeout = app.config.get('timing', {}).get('scan_timeout', 5)
 
@@ -1148,7 +2343,7 @@ class ScanWuzuScreen(Screen):
         """This screen wants all space for scanning display"""
         return {
             'main': available_rows,
-            'secondary': 0
+            'secondary': None
         }
 
     def handle(self, key, uid):
@@ -1163,14 +2358,19 @@ class ScanWuzuScreen(Screen):
         tags = self.app.uhf.inventory()
         for tag in tags:
             epc = tag["epc"]
-            if epc not in self.found:
-                self.found.add(epc)
+            if epc not in self.found and epc not in self.unknown:
                 self.last_time = time.time()
-                
+
                 hunter = self.app.db.get_hunter(self.hunter_uid)
                 if hunter:
                     points = self.app.db.get_wuzu_points(epc)
-                    self.app.record_wuzu_scan(self.hunter_uid, epc, points)
+                    if points > 0:
+                        self.found.add(epc)
+                        self.session_points += points
+                        self.app.record_wuzu_scan(self.hunter_uid, epc, points)
+                    else:
+                        self.unknown.add(epc)
+
                     self.app.beep("new_wuzu")
                     self.app.tui.mark_dirty(PANEL_MAIN)
                     self.app.tui.mark_dirty(PANEL_FOOTER)
@@ -1180,7 +2380,7 @@ class ScanWuzuScreen(Screen):
 
         if time.time() - self.last_time > self.timeout:
             self.app.beep("complete")
-            self.app.switch_screen(ResultsScreen(self.app, self.hunter_uid, self.found))
+            self.app.switch_screen(ResultsScreen(self.app, self.hunter_uid, self.found, self.session_points, self.rank_before, len(self.unknown)))
 
     def render_main(self, bounded, app_state):
         """Show scanning progress"""
@@ -1194,7 +2394,11 @@ class ScanWuzuScreen(Screen):
         
         bounded.print_centered(start_row + 1, f"Hunter: {name}")
         bounded.print_centered(start_row + 3, "SCANNING FOR WUZUS...")
-        bounded.print_centered(start_row + 5, f"Found: {len(self.found)} wuzus")
+        wuzu_label = "Wuzu" if len(self.found) == 1 else "Wuzus"
+        bounded.print_centered(start_row + 5, f"Found: {len(self.found)} {wuzu_label}")
+        if self.unknown:
+            entity_label = "Unknown Entity Detected" if len(self.unknown) == 1 else "Unknown Entities Detected"
+            bounded.print_centered(start_row + 7, f"{len(self.unknown)} {entity_label}")
 
     def render_footer(self, bounded, app_state):
         left = max(0, int(self.timeout - (time.time() - self.last_time)))
@@ -1208,10 +2412,13 @@ class ScanWuzuScreen(Screen):
 # RESULTS SCREEN
 # =============================================================================
 class ResultsScreen(Screen):
-    def __init__(self, app, hunter_uid, wuzus):
+    def __init__(self, app, hunter_uid, wuzus, session_points=0, rank_before=None, unknown_count=0):
         super().__init__(app)
         self.hunter_uid = hunter_uid
         self.wuzus = list(wuzus)
+        self.session_points = session_points
+        self.rank_before = rank_before
+        self.unknown_count = unknown_count
         self.timeout = app.config.get('timing', {}).get('results_display', 10)
         self.start_time = time.time()  # Track when we started
 
@@ -1219,7 +2426,7 @@ class ResultsScreen(Screen):
         """This screen wants all space for results display"""
         return {
             'main': available_rows,
-            'secondary': 0
+            'secondary': None
         }
 
     def handle(self, key, uid):
@@ -1236,18 +2443,33 @@ class ResultsScreen(Screen):
     def render_main(self, bounded, app_state):
         """Show results summary"""
         bounded.set_title("SCAN COMPLETE")
-        
+
         hunter = self.app.db.get_hunter(self.hunter_uid)
         name = hunter['name'] if hunter else "Unknown"
-        points = hunter['points'] if hunter else 0
-        
+        total_points = hunter['points'] if hunter else 0
+        total_unique = self.app.db.get_hunter_total_wuzus(self.hunter_uid)
+        total_scans = self.app.db.get_hunter_total_scans(self.hunter_uid)
+        current_rank = self.app.db.get_hunter_rank(self.hunter_uid)
+
         content_cols, content_rows = bounded.content_size()
-        start_row = (content_rows - 6) // 2 + 1
-        
-        bounded.print_centered(start_row + 1, "SCAN COMPLETE!")
-        bounded.print_centered(start_row + 3, f"Hunter: {name}")
-        bounded.print_centered(start_row + 4, f"Wuzus Found: {len(self.wuzus)}")
-        bounded.print_centered(start_row + 5, f"Total Points: {points}")
+        start_row = (content_rows - 12) // 2 + 1
+
+        bounded.print_centered(start_row, "SCAN COMPLETE!")
+        bounded.print_centered(start_row + 2, f"Hunter: {name}")
+        bounded.print_centered(start_row + 4, "--- THIS SESSION ---")
+        bounded.print_centered(start_row + 5, f"Wuzus Found: {len(self.wuzus)}    Points Earned: {self.session_points}")
+        if self.unknown_count > 0:
+            entity_label = "Unknown Entity Detected" if self.unknown_count == 1 else "Unknown Entities Detected"
+            bounded.print_centered(start_row + 6, f"{self.unknown_count} {entity_label}")
+        bounded.print_centered(start_row + 7, "--- ALL TIME ---")
+        bounded.print_centered(start_row + 8, f"Unique Wuzus: {total_unique}    Total Scans: {total_scans}    Total Points: {total_points}")
+
+        rank_text = f"Rank: #{current_rank}" if current_rank else "Rank: --"
+        if self.rank_before and current_rank and current_rank < self.rank_before:
+            rank_text += f" (up from #{self.rank_before}!)"
+        elif self.rank_before and current_rank and current_rank > self.rank_before:
+            rank_text += f" (down from #{self.rank_before})"
+        bounded.print_centered(start_row + 10, rank_text)
 
     def render_footer(self, bounded, app_state):
         # Calculate remaining time for display
@@ -1312,7 +2534,9 @@ class WuzuApp:
             "start": time.time(),
         }
 
+        self.authenticated_admin = None
         self.screen = StartScreen(self)
+        self.db.log_system_event("SYSTEM_START", details="Application started")
         self.last_time_update = 0
         self.last_data_refresh = 0
         self.last_db_health_check = 0
@@ -1337,18 +2561,19 @@ class WuzuApp:
 
     def register_hunter(self, uid, name):
         if self.db.add_hunter(uid, name):
-            self.log_event("NEW", hunter_uid=uid, details=f"Hunter '{name}' UID {uid}")
+            self.log_event("NEW", hunter_uid=uid, details=f"Hunter '{name}' registered")
             self.beep("hunter_id")
             self.tui.force_full_redraw()
 
     def register_wuzu(self, epc):
-        if self.db.add_wuzu(epc):
-            self.log_event("NEW", wuzu_epc=epc, details=f"Wuzu EPC {epc}")
+        default_points = self.config.get('scoring', {}).get('default_points', 10)
+        if self.db.add_wuzu(epc, points_value=default_points):
+            self.log_event("NEW", wuzu_epc=epc, details="New Wuzu registered")
             self.beep("new_wuzu")
             self.tui.force_full_redraw()
 
-    def log_event(self, event_type, hunter_uid=None, wuzu_epc=None, details="", points=0):
-        self.db.log_event(event_type, hunter_uid, wuzu_epc, details, points)
+    def log_event(self, event_type, hunter_uid=None, wuzu_epc=None, details="", points=0, private=False):
+        self.db.log_event(event_type, hunter_uid, wuzu_epc, details, points, private)
         self.tui.mark_dirty(PANEL_SECONDARY)
     
     def record_wuzu_scan(self, hunter_uid, wuzu_epc, points=10):
@@ -1357,8 +2582,10 @@ class WuzuApp:
         if hunter:
             self.db.update_hunter_score(hunter_uid, points)
             self.db.increment_wuzu_found(wuzu_epc)
-            self.log_event("SCORE", hunter_uid, wuzu_epc, 
-                          f"{hunter['name']} caught Wuzu {wuzu_epc} (+{points}pts)", 
+            wuzu = self.db.get_wuzu(wuzu_epc)
+            wuzu_name = wuzu['name'] if wuzu and wuzu.get('name') else "a Wuzu"
+            self.log_event("SCORE", hunter_uid, wuzu_epc,
+                          f"{hunter['name']} caught {wuzu_name} (+{points}pts)",
                           points)
 
     def run(self):
@@ -1434,6 +2661,8 @@ def get_default_config():
             'scan_interval': 0.2,
             'nfc_poll_interval': 0.05,
             'leaderboard_refresh': 60,
+            'idle_timeout': 120,
+            'screensaver_interval': 5,
         },
         'audio': {
             'beep_enabled': True,

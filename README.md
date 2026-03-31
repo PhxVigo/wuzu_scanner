@@ -97,6 +97,7 @@ sudo -u postgres createuser wuzu_user -P
 
 # Grant privileges
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"wuzu-1\" TO wuzu_user;"
+```
 
 ### 4. Configure Application
 

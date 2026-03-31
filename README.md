@@ -38,6 +38,15 @@ A terminal-based RFID hunting game using NFC badges for player identification an
 
 ## Installation
 
+### 0. Download Repo
+
+  ```bash
+  wget https://github.com/PhxVigo/wuzu_scanner/archive/refs/heads/main.zip
+  unzip main.zip
+  mv wuzu_scanner-main wuzu_scanner
+  cd wuzu_scanner
+  ```
+
 ### 1. Install System Dependencies
 
 **Windows:**
@@ -77,13 +86,6 @@ sudo -u postgres createuser wuzu_user -P
 # Grant privileges
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"wuzu-1\" TO wuzu_user;"
 
-# Load schema
-sudo -u postgres psql wuzu-1 < schema.sql
-
-# Verify tables were created (should show hunters, wuzus, admins, scan_events)
-sudo -u postgres psql wuzu-1 -c "\dt"
-```
-
 ### 4. Configure Application
 
 ```bash
@@ -95,11 +97,15 @@ nano config.toml
 > **Note:** `config.toml` is gitignored because it contains your database credentials. Never commit it. Always start from `example-config.toml`.
 
 **Important config items to set:**
-- `database.host` - Database server address
-- `database.password` - Your PostgreSQL password
-- `database.database` - Your database name
-- `hardware.uhf_type` - `"serial"` or `"keyboard"` for your UHF reader type
-- `hardware.uhf_port` - Your UHF reader's serial port (if using serial)
+- `database.host` - Database server address (Try "localhost")
+- `database.database` - Your database name (Try "wuzu-1")
+- `database.user` - Your database user (Try "wuzu_user")
+- `database.password` - Your database user password
+
+### 4. Connect Hardware
+
+- Plug in NFC reader
+- Plug in UHF reader
 
 ### 5. Detect Hardware
 
@@ -108,6 +114,10 @@ python3 detect_scanners.py
 ```
 
 Auto-detects NFC readers, serial UHF readers, and keyboard wedge scanners. Offers to update `config.toml` with detected hardware settings.
+If it can not autodetect, troubleshoot and manually enter settings in config.toml
+- `hardware.uhf_type` - `"serial"` or `"keyboard"` for your UHF reader type
+- `hardware.uhf_port` - Your UHF reader's serial port (if using serial)
+- `hardware.uhf_baudrate` - Your UHF reader's serial speed (if using serial)
 
 ### 6. Initialize System
 
@@ -121,13 +131,6 @@ Interactive setup that:
 3. Backs up existing database (using `pg_dump`)
 4. Recreates the database schema from `schema.sql`
 5. Imports wuzu tags from `wuzu_tags.csv`, assigning random names from `names.csv` and facts from `facts.csv`
-
-### 7. Connect Hardware
-
-- Plug in NFC reader (should auto-detect via PC/SC)
-- Plug in UHF reader:
-  - **Serial**: Note the serial port and update `uhf_port` in `config.toml`
-  - **Keyboard wedge**: Set `uhf_type = "keyboard"` in `config.toml`
 
 ## CSV Data Files
 

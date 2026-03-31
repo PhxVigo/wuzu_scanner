@@ -259,8 +259,8 @@ ORDER BY times_found DESC;
 wuzu_scanner/
 ├── wuzu_scanner_db.py      # Main application
 ├── schema.sql              # Database schema
-├── config.toml             # Your configuration
-├── config.toml.example     # Example configuration
+├── config.toml             # Custom configuration
+├── QUICK_REFERENCE.md      # short guide on how to use the software
 └── README.md               # This file
 ```
 

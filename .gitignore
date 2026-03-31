@@ -1,0 +1,15 @@
+# Private configuration (contains database credentials)
+config.toml
+
+# Python
+__pycache__/
+*.pyc
+
+# Database backups
+backups/
+
+# Claude Code
+.claude/
+
+# Experimental
+experimental/

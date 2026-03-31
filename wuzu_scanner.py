@@ -411,6 +411,123 @@ class UHFReader:
 
 
 # =============================================================================
+# KEYBOARD WEDGE UHF SUPPORT
+# =============================================================================
+class KeyboardWedgeBuffer:
+    """
+    Intercepts keystrokes to separate rapid keyboard-wedge scanner input
+    from normal human keypresses. Scanner input arrives as a burst of
+    characters (all within a few ms) terminated by Enter.
+    """
+    def __init__(self, max_gap=0.1, min_length=8):
+        self.buffer = ""
+        self.last_char_time = 0
+        self.pending_tags = []
+        self.key_queue = []
+        self.max_gap = max_gap      # Max seconds between chars to be considered a scan
+        self.min_length = min_length  # Min chars for a valid tag ID
+
+    def process_key(self, key):
+        """
+        Feed a keystroke (or None) from read_key().
+        Returns a user keypress character, or None if consumed by scanner buffer.
+        """
+        now = time.time()
+
+        # If no key pressed, check for buffer timeout
+        if key is None:
+            if self.key_queue:
+                return self.key_queue.pop(0)
+            if self.buffer and (now - self.last_char_time) > self.max_gap:
+                self._flush_buffer_as_keys()
+                if self.key_queue:
+                    return self.key_queue.pop(0)
+            return None
+
+        # Enter terminates a potential scan
+        if key in ("\r", "\n"):
+            if self.buffer and len(self.buffer) >= self.min_length:
+                # Looks like a scanner read - save as tag, cap at 1
+                self.pending_tags = [{"epc": self.buffer.upper()}]
+                self.buffer = ""
+                return None
+            else:
+                # Short buffer or empty - flush as user keypresses
+                self._flush_buffer_as_keys()
+                self.key_queue.append(key)
+                return self.key_queue.pop(0)
+
+        # Escape always passes through immediately
+        if key == "\x1b":
+            self._flush_buffer_as_keys()
+            self.key_queue.append(key)
+            return self.key_queue.pop(0)
+
+        # Printable character - decide whether to buffer or pass through
+        if self.buffer:
+            gap = now - self.last_char_time
+            if gap <= self.max_gap:
+                # Fast enough to be part of a scan burst
+                self.buffer += key
+                self.last_char_time = now
+                return None
+            else:
+                # Too slow - old buffer was human typing, flush it
+                self._flush_buffer_as_keys()
+                # Start new buffer with this character
+                self.buffer = key
+                self.last_char_time = now
+                if self.key_queue:
+                    return self.key_queue.pop(0)
+                return None
+        else:
+            # Start buffering this character
+            self.buffer = key
+            self.last_char_time = now
+            return None
+
+    def _flush_buffer_as_keys(self):
+        """Push buffered characters back as individual user keypresses."""
+        for ch in self.buffer:
+            self.key_queue.append(ch)
+        self.buffer = ""
+
+    def get_tags(self):
+        """Return and clear any completed scan tags."""
+        tags = self.pending_tags
+        self.pending_tags = []
+        return tags
+
+
+class KeyboardWedgeUHF:
+    """UHF reader interface for keyboard-wedge USB scanners."""
+    def __init__(self):
+        self.ser = None  # No serial port; needed for compatibility checks
+        self.wedge_buffer = KeyboardWedgeBuffer()
+        print("[UHF] Keyboard wedge mode enabled")
+
+    def inventory(self):
+        return self.wedge_buffer.get_tags()
+
+    def beep(self, active=2, silent=1, times=1):
+        if platform.system() == "Windows":
+            import winsound
+            for i in range(times):
+                winsound.Beep(1000, max(active * 100, 50))
+                if silent > 0 and i < times - 1:
+                    time.sleep(silent * 0.1)
+        else:
+            sys.stdout.write("\a")
+            sys.stdout.flush()
+
+    def set_power(self, power):
+        pass
+
+    def get_reader_info(self):
+        print("[UHF] Keyboard wedge reader (no serial info)")
+
+
+# =============================================================================
 # DATABASE MANAGER
 # =============================================================================
 class DatabaseManager:
@@ -2509,10 +2626,14 @@ class WuzuApp:
         self.terminal.clear()
 
         self.nfc = NFCReader()
-        self.uhf = UHFReader(
-            port=config.get('hardware', {}).get('uhf_port'),
-            baud=config.get('hardware', {}).get('uhf_baudrate', 57600),
-        )
+        uhf_type = config.get('hardware', {}).get('uhf_type', 'serial')
+        if uhf_type == 'keyboard':
+            self.uhf = KeyboardWedgeUHF()
+        else:
+            self.uhf = UHFReader(
+                port=config.get('hardware', {}).get('uhf_port'),
+                baud=config.get('hardware', {}).get('uhf_baudrate', 57600),
+            )
         
         # Database connection
         self.db = DatabaseManager(config)
@@ -2551,9 +2672,8 @@ class WuzuApp:
         if beep_cfg is None:
             return
 
-        if self.uhf.ser:
-            active, silent, times = beep_cfg
-            self.uhf.beep(active, silent, times)
+        active, silent, times = beep_cfg
+        self.uhf.beep(active, silent, times)
 
     def switch_screen(self, screen):
         self.screen = screen
@@ -2592,11 +2712,30 @@ class WuzuApp:
         print("Starting application...")
         time.sleep(2)
         self.terminal.clear()
+        is_wedge = isinstance(self.uhf, KeyboardWedgeUHF)
 
         try:
             while True:
                 time.sleep(self.config.get('timing', {}).get('nfc_poll_interval', 0.05))
-                key = read_key()
+
+                if is_wedge:
+                    # Drain all available keystrokes through the wedge buffer
+                    user_key = None
+                    while True:
+                        raw = read_key()
+                        if raw is None:
+                            # Check for timeout flush of buffered chars
+                            flushed = self.uhf.wedge_buffer.process_key(None)
+                            if flushed and user_key is None:
+                                user_key = flushed
+                            break
+                        result = self.uhf.wedge_buffer.process_key(raw)
+                        if result is not None and user_key is None:
+                            user_key = result
+                    key = user_key
+                else:
+                    key = read_key()
+
                 uid = self.nfc.poll_for_card()
                 self.screen.handle(key, uid)
 

@@ -1,17 +1,20 @@
 # config.toml
 # Wuzu Scanner Configuration File
+# Copy this file to config.toml and update with your settings:
+#   cp example-config.toml config.toml
 
 [database]
 # PostgreSQL connection settings
 host = "localhost"
 port = 5432
-database = "wuzu-1"
+database = "wuzu"
 user = "postgres"
-password = "1234"
+password = "your_password"
 
 [hardware]
 # UHF Reader settings
-uhf_port = "COM9"           # Windows: "COM3", "COM9", etc. | Linux: "/dev/ttyUSB0"
+uhf_type = "serial"         # "serial" for UR-2000, "keyboard" for USB keyboard wedge scanner
+uhf_port = "COM3"           # Windows: "COM3", "COM9", etc. | Linux: "/dev/ttyUSB0"
                             # Set to null for auto-detection
 uhf_baudrate = 57600        # Usually 57600 or 115200
 uhf_power = 20              # RF Power in dBm (0-30, higher = longer range)

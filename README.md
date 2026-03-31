@@ -59,6 +59,23 @@ sudo apt update
 sudo apt install python3 python3-pip postgresql postgresql-contrib postgresql-client pcscd libpcsclite-dev
 sudo systemctl start postgresql
 sudo systemctl enable postgresql
+sudo systemctl start pcscd
+sudo systemctl enable pcscd
+```
+
+We may need to make sure kernel service doesn;t grab our NFC reader.
+```bash
+sudo bash -c 'echo "blacklist pn533_usb
+blacklist pn533
+blacklist nfc" > /etc/modprobe.d/blacklist-nfc.conf'
+sudo modprobe -r pn533_usb pn533 nfc 2>/dev/null
+sudo systemctl start pcscd
+```
+
+Make sure your user has acccess to the serial ports (replace <your_user> with your login)
+```bash
+sudo usermod -aG dialout <your_user>
+newgrp dialout
 ```
 
 **Raspberry Pi:**

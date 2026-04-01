@@ -3,13 +3,12 @@
 ## Status Bar Indicators
 
 ```
-┌ DB:LOCAL | UPTIME:00:05:23 | LAST-SCAN:14:23:45 | TIME:14:30:12 ───┐
-   ↑            ↑                  ↑                     ↑
-   │            │                  │                     │
-   │            │                  │                     └─ Current time
-   │            │                  └─────────────────────── Last scan event
-   │            └────────────────────────────────────────── System uptime
-   └─────────────────────────────────────────────────────── Database status
+┌ DB:LOCAL | UPTIME:00:05:23 | TIME:14:30:12 ───┐
+   ↑            ↑                    ↑
+   │            │                    │
+   │            │                    └─ Current time
+   │            └────────────────────── System uptime
+   └─────────────────────────────────── Database status
 ```
 
 ### Database Status
@@ -32,17 +31,21 @@
 
 If an unregistered badge is scanned, you are prompted to add a new hunter:
 - **Y** or **Enter** - Register the badge as a new hunter
-- **N** or **X** - Dismiss (auto-cancels after 10 seconds)
+- **N** or **X** - Dismiss (auto-cancels after `unknown_tag_timeout` seconds)
 
 ### During Hunt
 | Key | Action |
 |-----|--------|
 | **X** | Exit hunting session early |
+| **R** | Redraw/refresh screen |
 
 ### Results Screen
 | Key | Action |
 |-----|--------|
 | **X** | Return to main screen immediately |
+| **R** | Redraw/refresh screen |
+
+Auto-returns to main screen after `results_display` seconds.
 
 ### Admin Screen
 Scan an admin NFC badge on the main screen to enter. Password is required on first access per session.
@@ -51,28 +54,43 @@ Scan an admin NFC badge on the main screen to enter. Password is required on fir
 |-----|--------|
 | **W** | Add new wuzu (register UHF tag) |
 | **E** | Edit wuzu (scan tag to select) |
+| **H** | Edit hunter (scan badge to select) |
 | **A** | Add new admin (scan badge, set name & password) |
+| **O** | Override scan (scan hunter badge, then force-score wuzus) |
+| **S** | Scan-out mode (scan wuzus to mark them as scanned out) |
 | **Q** | Quit application (with confirmation) |
 | **X** | Exit admin mode (return to main screen) |
-| **Scan hunter badge** | View hunter's event history |
+| **R** | Redraw/refresh screen |
 
-### Hunter History (within Admin)
+### Edit Hunter (within Admin)
+Scan a hunter badge to select. Shows the hunter's scan history panel.
+
 | Key | Action |
 |-----|--------|
-| **J** or **2** | Move selection down |
-| **K** or **8** | Move selection up |
-| **D** | Delete selected SCORE event (with confirmation) |
+| **N** | Edit hunter name |
 | **M** | Adjust hunter score (enter positive or negative number) |
+| **J** or **2** | Move selection down in scan history |
+| **K** or **8** | Move selection up in scan history |
 | **X** | Back to admin menu |
 
 ### Edit Wuzu (within Admin)
+Scan a wuzu UHF tag to select. Shows the wuzu's scan history panel.
+
 | Key | Action |
 |-----|--------|
 | **N** | Edit name |
 | **P** | Edit points value |
 | **F** | Edit fact |
 | **D** | Delete wuzu (soft delete, with confirmation) |
+| **J** or **2** | Move selection down in scan history |
+| **K** or **8** | Move selection up in scan history |
 | **X** | Back to admin menu |
+
+### Admin Override Scan
+Select **O** from the admin menu, then scan a hunter badge to target. All wuzus scanned in this mode score immediately, bypassing cooldown and scan-out validation. Unregistered wuzus score with `default_points` but are not registered. Logged as `OVERRIDE_SCORE` events.
+
+### Admin Scan-Out
+Select **S** from the admin menu, then scan wuzus to mark them as "scanned out". This clears them for re-scoring by hunters (when `scan_out` is enabled in config). Logged as `SCAN_OUT` events.
 
 ## Screen Saver
 
@@ -82,19 +100,63 @@ Activates after `idle_timeout` seconds of inactivity on the main screen (default
 
 The admin screen automatically returns to the main screen after `admin_timeout` seconds of inactivity (default: 30 seconds).
 
+## Points System & Scan Validation
+
+### Basic Scoring
+- Each unique wuzu found awards points (default: 10, set via `default_points` in `[scoring]`)
+- Points per wuzu can be individually changed via admin Edit Wuzu
+- Hunting session ends after `scan_timeout` seconds of no new finds (default: 5)
+- Results display for `results_display` seconds (default: 10)
+
+### Re-scoring Rules
+The `[scoring]` config section controls when a previously-found wuzu can be scored again:
+
+| Setting | Effect |
+|---------|--------|
+| `cooldown_minutes` | Minutes before same wuzu can be re-scored (0 = no cooldown) |
+| `scan_out` | Require the wuzu to be scanned out by an admin before re-scoring |
+| `cooldown_overrides_scan_out` | Allow expired cooldown to substitute for a missing scan-out |
+
+**Common configurations:**
+
+| Mode | Settings | Behavior |
+|------|----------|----------|
+| **Free play** | `scan_out=false`, `cooldown=0` | Everything scores freely, no restrictions |
+| **Cooldown only** | `scan_out=false`, `cooldown>0` | Must wait cooldown before re-scoring; valid scan-out overrides the wait |
+| **Scan-out only** | `scan_out=true`, `cooldown_overrides_scan_out=false` | Admin must scan out wuzu before it can be re-scored |
+| **Hybrid** | `scan_out=true`, `cooldown_overrides_scan_out=true`, `cooldown>0` | Scan-out required, but expired cooldown can substitute |
+
+Wuzus that fail validation are logged as `REJECTED` (not shown to the hunter).
+
+## Game Flow
+
+```
+Main Screen ──[Scan Hunter Badge]──> Hunting Mode ──> Results ──> Main Screen
+     │                                    │
+     ├── [A] Add Hunter                   └── Find Wuzus!
+     ├── [Scan Admin Badge] ──> Admin Screen
+     │        ├── [W] Add Wuzu
+     │        ├── [E] Edit Wuzu
+     │        ├── [H] Edit Hunter
+     │        ├── [A] Add Admin
+     │        ├── [O] Override Scan ──> Select Hunter ──> Force-score Wuzus
+     │        └── [S] Scan-Out ──> Mark Wuzus as Scanned Out
+     └── (idle) ──> Screen Saver ──(any input)──> Main Screen
+```
+
 ## Startup Checklist
 
 1. Copy `example-config.toml` to `config.toml` if you haven't already
 2. Hardware connected (NFC reader + UHF reader)
 3. PostgreSQL running (`sudo systemctl status postgresql`)
 4. Database credentials set in `config.toml`
-5. Serial UHF: correct port in `config.toml` (`COM9`, `/dev/ttyUSB0`, etc.)
+5. Serial UHF: correct port in `config.toml` (`COM3`, `/dev/ttyUSB0`, etc.)
 
 **Expected startup output:**
 ```
 [NFC] Using: ACS ACR122U PICC Interface 00 00
-[UHF] Opened COM9
-[DB] Connected to wuzu-1 at localhost:5432
+[UHF] Opened COM3
+[DB] Connected to wuzu at localhost:5432
 [DB] Connection test successful
 [DB] Status: LOCAL
 [DB] PostgreSQL 14.5
@@ -106,7 +168,7 @@ Starting application...
 ### DB:OFFLINE appears
 1. Check PostgreSQL is running
 2. Verify credentials in `config.toml`
-3. Test manually: `psql -h localhost -U postgres wuzu-1`
+3. Test manually: `psql -h localhost -U wuzu wuzu`
 
 ### NFC reader not found
 1. Check USB connection
@@ -117,23 +179,6 @@ Starting application...
 1. Check USB/serial connection
 2. Verify port in `config.toml` matches device
 3. Linux: check permissions `sudo usermod -a -G dialout $USER`
-
-## Points System
-
-- Each unique wuzu found awards points (default: 10, set via `default_points` in `[scoring]`)
-- Points per wuzu can be individually changed via admin Edit Wuzu
-- Hunting session ends after `scan_timeout` seconds of no new finds (default: 5)
-- Results display for `results_display` seconds (default: 10)
-
-## Game Flow
-
-```
-Main Screen ──[Scan Hunter Badge]──> Hunting Mode ──> Results ──> Main Screen
-     │                                    │
-     ├── [A] Add Hunter                   └── Find Wuzus!
-     ├── [Scan Admin Badge] ──> Admin Screen
-     └── (idle) ──> Screen Saver ──(any input)──> Main Screen
-```
 
 ## Database Schema
 
@@ -167,12 +212,12 @@ Copy `example-config.toml` to `config.toml` and edit with your settings. `config
 [database]
 host = "localhost"          # Database server (determines LOCAL vs REMOTE)
 port = 5432
-database = "wuzu-1"         # Database name
-user = "postgres"
+database = "wuzu"           # Database name
+user = "wuzu"
 password = "your_password"
 
 [hardware]
-uhf_port = "COM9"           # Windows: COMx, Linux: /dev/ttyUSBx
+uhf_port = "COM3"           # Windows: COMx, Linux: /dev/ttyUSBx
 uhf_baudrate = 57600        # Usually 57600 or 115200
 uhf_power = 20              # RF power 0-30 dBm
 
@@ -192,11 +237,16 @@ beep_enabled = true
 
 [audio.beeps]
 new_wuzu = [1, 0, 1]       # Quick beep on wuzu found
-hunter_id = [2, 1, 2]      # Double beep on badge scan
-complete = [3, 2, 3]        # Triple beep on session end
+hunter_id = [0, 0, 0]      # Beep on badge scan (disabled)
+complete = [0, 0, 0]        # Beep on session end (disabled)
+# Format: [active_time, silent_time, times]
+# active_time/silent_time in 100ms units, [0,0,0] = disabled
 
 [scoring]
 default_points = 10         # Points assigned to new wuzus
+cooldown_minutes = 1        # Minutes before re-scoring same wuzu (0 = disabled)
+scan_out = false            # Require admin scan-out before re-scoring
+cooldown_overrides_scan_out = false  # Expired cooldown substitutes for scan-out
 
 [display]
 border_char = "─"

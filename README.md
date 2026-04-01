@@ -61,7 +61,7 @@ sudo systemctl start pcscd
 sudo systemctl enable pcscd
 ```
 
-We may need to make sure kernel service doesn;t grab our NFC reader.
+We may need to make sure kernel service doesn't grab our NFC reader.
 ```bash
 sudo bash -c 'echo "blacklist pn533_usb
 blacklist pn533
@@ -89,13 +89,13 @@ pip install tomli --break-system-packages
 
 ```bash
 # Create database and user
-sudo -u postgres createdb wuzu-1
-sudo -u postgres createuser wuzu_user -P
+sudo -u postgres createdb wuzu
+sudo -u postgres createuser wuzu -P
 # (Enter password when prompted)
 
 # Grant privileges
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"wuzu-1\" TO wuzu_user;"
-sudo -u postgres psql "wuzu-1" -c "GRANT ALL ON SCHEMA public TO wuzu_user;"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"wuzu\" TO wuzu;"
+sudo -u postgres psql "wuzu" -c "GRANT ALL ON SCHEMA public TO wuzu;"
 ```
 
 ### 4. Configure Application
@@ -109,11 +109,17 @@ nano config.toml
 > **Note:** `config.toml` is gitignored because it contains your database credentials. Never commit it. Always start from `example-config.toml`.
 
 **Important config items to set:**
-- `database.host` - Database server address
-- `database.password` - Your PostgreSQL password
-- `database.database` - Your database name
+- `database.host` - Database server address ("localhost" probably)
+- `database.database` - Your database name ("wuzu" default)
+- `database.user` - Your database username ("wuzu" default)
+- `database.password` - Your database uer's password (You set this in step 3)
 
-### 4. Detect Hardware
+### 4. Connect Hardware
+
+- Plug in NFC reader
+- Plug in UHF reader
+
+### 5. Detect Hardware
 
 ```bash
 python3 detect_scanners.py
@@ -121,7 +127,7 @@ python3 detect_scanners.py
 
 Auto-detects NFC readers and serial UHF readers. Offers to update `config.toml` with detected hardware settings.
 
-### 5. Initialize System
+### 7. Initialize System
 
 ```bash
 python3 wuzu_init.py
@@ -134,15 +140,10 @@ Interactive setup that:
 4. Recreates the database schema from `schema.sql`
 5. Imports wuzu tags from `wuzu_tags.csv`, assigning random names from `names.csv` and facts from `facts.csv`
 
-### 6. Connect Hardware
-
-- Plug in NFC reader (should auto-detect via PC/SC)
-- Plug in UHF reader:
-  - Note the serial port and update `uhf_port` in `config.toml`
-
 ## CSV Data Files
 
-These files are used during system initialization (`wuzu_init.py`):
+These files are used during system initialization (`wuzu_init.py`).
+They are not actually comma seperated, but one entry per line.
 
 | File | Description |
 |------|-------------|
@@ -160,110 +161,17 @@ On startup, you should see:
 ```
 [NFC] Using: ACS ACR122U PICC Interface 00 00
 [UHF] Opened COM9
-[DB] Connected to wuzu-1 at localhost:5432
+[DB] Connected to wuzu at localhost:5432
 [DB] Connection test successful
 [DB] Status: LOCAL
 [DB] PostgreSQL 14.5
 Starting application...
 ```
 
-The status bar at the top shows:
+The status bar at the bottom shows:
 - **DB:LOCAL** / **DB:REMOTE** / **DB:OFFLINE** - Database connection status
 - **UPTIME** - How long the application has been running
-- **LAST-SCAN** - Time of most recent scan event
 - **TIME** - Current system time
-
-## Usage
-
-### Main Screen
-- **[A]** - Add new hunter (register a new player badge)
-- **[R]** - Redraw screen
-- **Scan hunter badge** - Starts a hunting session
-- **Scan admin badge** - Enters admin mode
-
-If an unregistered badge is scanned, you are prompted to register it as a new hunter (**Y/N**).
-
-### Adding Hunters
-1. Press **A**
-2. Scan the player's NFC badge
-3. Type their name and press Enter
-
-### Hunting
-1. Hunter scans their badge on main screen
-2. Hunt for wuzus with the UHF reader
-3. Each new wuzu found adds points
-4. Session ends after 5 seconds of no new finds (configurable)
-
-### Admin Mode
-1. Scan an admin NFC badge on the main screen
-2. Enter admin password when prompted
-3. Admin commands:
-   - **[W]** - Add new wuzu (register UHF tag)
-   - **[E]** - Edit wuzu (name, points, fact, or delete)
-   - **[A]** - Add new admin
-   - **[Q]** - Quit application
-   - **[X]** - Exit admin mode
-   - **Scan hunter badge** - View and manage their event history
-
-## Configuration Reference
-
-### Database Settings
-```toml
-[database]
-host = "localhost"          # Database server (determines LOCAL vs REMOTE status)
-port = 5432                 # PostgreSQL port
-database = "wuzu-1"         # Database name
-user = "postgres"           # Username
-password = "your_password"  # Password
-```
-
-### Hardware Settings
-```toml
-[hardware]
-uhf_port = "COM9"           # Serial port for UHF reader
-uhf_baudrate = 57600        # Usually 57600 or 115200
-uhf_power = 20              # RF power 0-30 dBm
-```
-
-### Timing Settings
-```toml
-[timing]
-scan_timeout = 5            # Inactivity timeout before hunt ends (seconds)
-results_display = 10        # Results screen duration (seconds)
-scan_interval = 0.2         # UHF inventory scan interval (seconds)
-nfc_poll_interval = 0.05    # NFC poll interval (seconds)
-leaderboard_refresh = 60    # Leaderboard refresh rate (seconds)
-idle_timeout = 30           # Seconds before screen saver activates
-screensaver_interval = 5    # Screen saver text movement interval (seconds)
-admin_timeout = 30          # Admin screen idle timeout (seconds)
-unknown_tag_timeout = 10    # Unknown tag prompt auto-cancel (seconds)
-```
-
-### Audio Settings
-```toml
-[audio]
-beep_enabled = true
-
-[audio.beeps]
-# Format: [duration, pause, times]
-# Duration/pause in 100ms units
-new_wuzu = [1, 0, 1]        # Quick beep on wuzu found
-hunter_id = [2, 1, 2]       # Double beep on badge scan
-complete = [3, 2, 3]        # Triple beep on session end
-```
-
-### Scoring Settings
-```toml
-[scoring]
-default_points = 10         # Points assigned to new wuzus
-```
-
-### Display Settings
-```toml
-[display]
-border_char = "─"                    # Character used for borders
-main_title = "WUZUScan-76 v1.09b"   # Title displayed in various screens
-```
 
 ## Troubleshooting
 
@@ -294,7 +202,7 @@ python3 -c "import serial; print(serial.tools.list_ports.comports())"
 sudo systemctl status postgresql
 
 # Test connection manually
-psql -h localhost -U postgres -d wuzu-1
+psql -h localhost -U wuzu -d wuzu
 
 # Check credentials in config.toml match database
 ```
@@ -305,76 +213,3 @@ psql -h localhost -U postgres -d wuzu-1
 sudo usermod -a -G dialout $USER
 # Log out and back in for changes to take effect
 ```
-
-## Database Schema
-
-### Tables
-- **hunters** - Player profiles and scores
-- **wuzus** - Tagged objects, names, facts, and point values
-- **admins** - Admin accounts with password authentication
-- **scan_events** - Complete event log with soft-delete and audit trail
-
-### Useful Queries
-
-```sql
--- View leaderboard
-SELECT name, points, last_seen 
-FROM hunters 
-ORDER BY points DESC;
-
--- Recent activity
-SELECT timestamp, event_type, details 
-FROM scan_events 
-WHERE NOT deleted AND NOT private
-ORDER BY timestamp DESC 
-LIMIT 20;
-
--- Most popular wuzus
-SELECT name, epc, times_found 
-FROM wuzus 
-WHERE NOT deleted
-ORDER BY times_found DESC;
-```
-
-## Development
-
-### Project Structure
-```
-wuzu_scanner/
-├── wuzu_scanner.py             # Main application
-├── wuzu_init.py                # System initialization script
-├── detect_scanners.py          # Hardware auto-detection tool
-├── schema.sql                  # Database schema (4 tables)
-├── example-config.toml         # Example configuration (copy to config.toml)
-├── wuzu_tags.csv               # UHF tag inventory for import
-├── names.csv                   # Wuzu names for random assignment
-├── facts.csv                   # Cyberpunk fun facts for wuzus
-├── GUIDE.md                    # Usage guide and quick reference
-├── README.md                   # This file
-├── CHANGELOG.md                # Change history
-└── backups/                    # Database backups (created by wuzu_init.py)
-```
-
-### Screen Architecture
-The application uses a screen-based architecture:
-- `Screen` - Base class for all screens
-- `StartScreen` - Main leaderboard view
-- `ScreenSaverScreen` - Idle screen saver animation
-- `AddHunterScreen` - Register new players
-- `AdminScreen` - Admin mode (history, wuzu editing, admin management)
-- `AddWuzuScreen` - Register new tags
-- `ScanWuzuScreen` - Active hunting session
-- `ResultsScreen` - Post-hunt summary
-
-## License
-
-MIT License - Feel free to modify and distribute
-
-## Support
-
-For issues and questions:
-1. Check the `GUIDE.md` for keyboard commands and quick reference
-2. Check the troubleshooting section above
-3. Verify hardware connections
-4. Test database connectivity
-5. Review logs for error messages

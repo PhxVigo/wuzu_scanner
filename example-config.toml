@@ -13,7 +13,6 @@ password = "your_password"
 
 [hardware]
 # UHF Reader settings
-uhf_type = "serial"         # "serial" for UR-2000, "keyboard" for USB keyboard wedge scanner
 uhf_port = "COM3"           # Windows: "COM3", "COM9", etc. | Linux: "/dev/ttyUSB0"
                             # Set to null for auto-detection
 uhf_baudrate = 57600        # Usually 57600 or 115200

@@ -5,7 +5,7 @@ A terminal-based RFID hunting game using NFC badges for player identification an
 ## Features
 
 - **NFC Badge Authentication**: Players scan their badge to start hunting
-- **UHF RFID Scanning**: Hunt for tagged objects in the environment (serial or keyboard wedge)
+- **UHF RFID Scanning**: Hunt for tagged objects in the environment
 - **Real-time Leaderboard**: PostgreSQL-backed scoreboard
 - **Admin Mode**: Score management, wuzu editing, event auditing via admin badge
 - **Event Logging**: Complete history of all scans and scores with soft-delete
@@ -19,9 +19,7 @@ A terminal-based RFID hunting game using NFC badges for player identification an
 ## Hardware Requirements
 
 - **NFC Reader**: PC/SC compatible reader (e.g., ACR122U) for player badges
-- **UHF RFID Reader**: Either:
-  - Serial-connected UHF reader (e.g., GeeNFC UHF reader, UR-2000)
-  - USB keyboard-wedge UHF scanner
+- **UHF RFID Reader**: Serial-connected UHF reader (e.g., GeeNFC UHF reader, UR-2000)
 - **NFC Tags**: ISO14443A tags for player badges
 - **UHF Tags**: EPC Gen2 tags for wuzus
 
@@ -111,29 +109,19 @@ nano config.toml
 > **Note:** `config.toml` is gitignored because it contains your database credentials. Never commit it. Always start from `example-config.toml`.
 
 **Important config items to set:**
-- `database.host` - Database server address (Try "localhost")
-- `database.database` - Your database name (Try "wuzu-1")
-- `database.user` - Your database user (Try "wuzu_user")
-- `database.password` - Your database user password
+- `database.host` - Database server address
+- `database.password` - Your PostgreSQL password
+- `database.database` - Your database name
 
-### 4. Connect Hardware
-
-- Plug in NFC reader
-- Plug in UHF reader
-
-### 5. Detect Hardware
+### 4. Detect Hardware
 
 ```bash
 python3 detect_scanners.py
 ```
 
-Auto-detects NFC readers, serial UHF readers, and keyboard wedge scanners. Offers to update `config.toml` with detected hardware settings.
-If it can not autodetect, troubleshoot and manually enter settings in config.toml
-- `hardware.uhf_type` - `"serial"` or `"keyboard"` for your UHF reader type
-- `hardware.uhf_port` - Your UHF reader's serial port (if using serial)
-- `hardware.uhf_baudrate` - Your UHF reader's serial speed (if using serial)
+Auto-detects NFC readers and serial UHF readers. Offers to update `config.toml` with detected hardware settings.
 
-### 6. Initialize System
+### 5. Initialize System
 
 ```bash
 python3 wuzu_init.py
@@ -145,6 +133,12 @@ Interactive setup that:
 3. Backs up existing database (using `pg_dump`)
 4. Recreates the database schema from `schema.sql`
 5. Imports wuzu tags from `wuzu_tags.csv`, assigning random names from `names.csv` and facts from `facts.csv`
+
+### 6. Connect Hardware
+
+- Plug in NFC reader (should auto-detect via PC/SC)
+- Plug in UHF reader:
+  - Note the serial port and update `uhf_port` in `config.toml`
 
 ## CSV Data Files
 
@@ -226,7 +220,6 @@ password = "your_password"  # Password
 ### Hardware Settings
 ```toml
 [hardware]
-uhf_type = "serial"         # "serial" for UR-2000, "keyboard" for USB keyboard wedge
 uhf_port = "COM9"           # Serial port for UHF reader
 uhf_baudrate = 57600        # Usually 57600 or 115200
 uhf_power = 20              # RF power 0-30 dBm
@@ -359,7 +352,6 @@ wuzu_scanner/
 ├── GUIDE.md                    # Usage guide and quick reference
 ├── README.md                   # This file
 ├── CHANGELOG.md                # Change history
-├── CHANGELOG_keyboard_wedge.md # Keyboard wedge feature changelog
 └── backups/                    # Database backups (created by wuzu_init.py)
 ```
 

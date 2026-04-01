@@ -85,11 +85,10 @@ The admin screen automatically returns to the main screen after `admin_timeout` 
 ## Startup Checklist
 
 1. Copy `example-config.toml` to `config.toml` if you haven't already
-2. Hardware connected (NFC reader + UHF reader, either serial or keyboard wedge)
+2. Hardware connected (NFC reader + UHF reader)
 3. PostgreSQL running (`sudo systemctl status postgresql`)
 4. Database credentials set in `config.toml`
 5. Serial UHF: correct port in `config.toml` (`COM9`, `/dev/ttyUSB0`, etc.)
-6. Keyboard wedge UHF: `uhf_type = "keyboard"` in `config.toml`
 
 **Expected startup output:**
 ```
@@ -118,11 +117,6 @@ Starting application...
 1. Check USB/serial connection
 2. Verify port in `config.toml` matches device
 3. Linux: check permissions `sudo usermod -a -G dialout $USER`
-
-### Keyboard wedge not working
-1. Ensure `uhf_type = "keyboard"` is set in `config.toml`
-2. No serial port configuration is needed for keyboard wedge scanners
-3. Run `python3 detect_scanners.py` to test and auto-configure
 
 ## Points System
 
@@ -154,7 +148,7 @@ Main Screen ──[Scan Hunter Badge]──> Hunting Mode ──> Results ──
 
 | Script | Purpose |
 |--------|---------|
-| `detect_scanners.py` | Auto-detects NFC readers, serial UHF readers, and keyboard wedge scanners. Offers to update `config.toml`. |
+| `detect_scanners.py` | Auto-detects NFC readers and serial UHF readers. Offers to update `config.toml`. |
 | `wuzu_init.py` | System initialization: sets up admin badge, backs up & recreates database, imports wuzu tags from CSV with random names and facts. |
 
 ## CSV Data Files
@@ -178,7 +172,6 @@ user = "postgres"
 password = "your_password"
 
 [hardware]
-uhf_type = "serial"         # "serial" for UR-2000, "keyboard" for USB keyboard wedge
 uhf_port = "COM9"           # Windows: COMx, Linux: /dev/ttyUSBx
 uhf_baudrate = 57600        # Usually 57600 or 115200
 uhf_power = 20              # RF power 0-30 dBm

@@ -85,82 +85,6 @@ def probe_uhf(port, baudrate, timeout=0.5):
         return False
 
 
-def scan_serial_uhf(port, baudrate, timeout=10):
-    """
-    Run inventory on a serial UHF reader and wait for a tag.
-    Returns the EPC hex string of the first tag found, or None on timeout.
-    """
-    try:
-        import serial
-    except ImportError:
-        return None
-
-    try:
-        ser = serial.Serial(
-            port=port,
-            baudrate=baudrate,
-            timeout=0.5,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            bytesize=serial.EIGHTBITS,
-        )
-        time.sleep(0.1)
-
-        print()
-        print(f"  Hold a UHF tag near the reader... ({timeout}s timeout, Ctrl+C to skip)")
-        print()
-
-        start = time.time()
-        while time.time() - start < timeout:
-            # Send inventory command (0x01)
-            cmd_data = bytes([0x04, 0x00, 0x01])
-            crc_val = crc16(cmd_data)
-            frame = cmd_data + bytes([crc_val & 0xFF, (crc_val >> 8) & 0xFF])
-
-            ser.reset_input_buffer()
-            ser.write(frame)
-            ser.flush()
-
-            # Read response
-            time.sleep(0.3)
-            resp = b''
-            read_start = time.time()
-            while time.time() - read_start < 0.5:
-                if ser.in_waiting > 0:
-                    resp += ser.read(ser.in_waiting)
-                    time.sleep(0.05)
-                elif len(resp) > 0:
-                    break
-                else:
-                    time.sleep(0.02)
-
-            # Parse inventory response: if len > 5 and tag count > 0
-            if len(resp) > 5 and resp[4] > 0:
-                pos = 5
-                epc_len = resp[pos]
-                pos += 1
-                if pos + epc_len <= len(resp) - 2:
-                    epc = resp[pos:pos + epc_len].hex().upper()
-                    ser.close()
-                    return epc
-
-            time.sleep(0.2)
-
-        ser.close()
-        print("  (timed out - no tag detected)")
-        return None
-
-    except KeyboardInterrupt:
-        try:
-            ser.close()
-        except Exception:
-            pass
-        print("  (skipped)")
-        return None
-    except Exception:
-        return None
-
-
 def detect_uhf():
     """
     Scan all serial ports for UHF readers.
@@ -209,76 +133,6 @@ def detect_uhf():
 
     return found
 
-
-# =============================================================================
-# Keyboard Wedge UHF Detection
-# =============================================================================
-def _read_char_nonblocking():
-    """Read a single character without blocking, or return None."""
-    if platform.system() == "Windows":
-        import msvcrt
-        if msvcrt.kbhit():
-            ch = msvcrt.getch()
-            try:
-                return ch.decode("utf-8")
-            except Exception:
-                return None
-    else:
-        import select
-        dr, _, _ = select.select([sys.stdin], [], [], 0.02)
-        if dr:
-            return sys.stdin.read(1)
-    return None
-
-
-def prompt_scan(label, timeout=15):
-    """
-    Prompt user to scan a tag (or press Escape to skip).
-    Captures keyboard-wedge input (rapid chars + Enter).
-    Returns the captured ID string, or None if skipped/timeout.
-    """
-    print()
-    print(f"  {label}")
-    print(f"  Scan a tag now, or press Escape to skip... ({timeout}s timeout)")
-    print()
-    sys.stdout.write("  > ")
-    sys.stdout.flush()
-
-    buf = ""
-    start = time.time()
-
-    while time.time() - start < timeout:
-        ch = _read_char_nonblocking()
-        if ch is None:
-            time.sleep(0.02)
-            continue
-        if ch == "\x1b":  # Escape
-            print(" (skipped)")
-            return None
-        if ch in ("\r", "\n"):
-            if buf:
-                print()
-                return buf
-            continue
-        buf += ch
-        sys.stdout.write(ch)
-        sys.stdout.flush()
-
-    print(" (timed out)")
-    return buf if buf else None
-
-
-def detect_keyboard_wedge():
-    """
-    Test for a keyboard wedge UHF reader by prompting the user to scan.
-    Returns the scanned tag ID or None.
-    """
-    tag_id = prompt_scan("Keyboard Wedge UHF Test")
-    if tag_id:
-        print(f"  Captured ID: {tag_id}")
-        print(f"  Length: {len(tag_id)} characters")
-        return tag_id
-    return None
 
 
 # =============================================================================
@@ -331,14 +185,10 @@ def find_config():
 
 def read_current_config(path):
     """Read current hardware values from config.toml."""
-    values = {'uhf_type': None, 'uhf_port': None, 'uhf_baudrate': None}
+    values = {'uhf_port': None, 'uhf_baudrate': None}
     try:
         with open(path, 'r') as f:
             text = f.read()
-
-        m = re.search(r'^uhf_type\s*=\s*"([^"]*)"', text, re.MULTILINE)
-        if m:
-            values['uhf_type'] = m.group(1)
 
         m = re.search(r'^uhf_port\s*=\s*"([^"]*)"', text, re.MULTILINE)
         if m:
@@ -353,29 +203,10 @@ def read_current_config(path):
     return values
 
 
-def update_config(path, uhf_type=None, uhf_port=None, uhf_baudrate=None):
+def update_config(path, uhf_port=None, uhf_baudrate=None):
     """Update config.toml in-place, preserving comments and formatting."""
     with open(path, 'r') as f:
         text = f.read()
-
-    if uhf_type is not None:
-        if re.search(r'^uhf_type\s*=', text, re.MULTILINE):
-            text = re.sub(
-                r'^(uhf_type\s*=\s*)"[^"]*"',
-                f'\\1"{uhf_type}"',
-                text,
-                count=1,
-                flags=re.MULTILINE,
-            )
-        else:
-            # Insert uhf_type before uhf_port
-            text = re.sub(
-                r'^(uhf_port\s*=)',
-                f'uhf_type = "{uhf_type}"           # "serial" for UR-2000, "keyboard" for USB keyboard wedge scanner\n\\1',
-                text,
-                count=1,
-                flags=re.MULTILINE,
-            )
 
     if uhf_port is not None:
         text = re.sub(
@@ -413,20 +244,9 @@ def main():
     print("Scanning serial ports for UHF readers...")
     uhf_found = detect_uhf()
 
-    serial_scan_id = None
     if uhf_found:
         best = uhf_found[0]
         print(f"\n  Found: {best['port']} @ {best['baudrate']} baud")
-        serial_scan_id = scan_serial_uhf(best['port'], best['baudrate'])
-        if serial_scan_id:
-            print(f"  Tag EPC: {serial_scan_id}")
-
-    # --- Keyboard Wedge UHF ---
-    wedge_scan_id = None
-    if not uhf_found:
-        print()
-        print("Testing for keyboard wedge UHF reader...")
-        wedge_scan_id = detect_keyboard_wedge()
 
     # --- NFC ---
     print()
@@ -441,17 +261,9 @@ def main():
 
     if uhf_found:
         best = uhf_found[0]
-        label = f"{best['port']} @ {best['baudrate']} baud ({best['description']})"
-        if serial_scan_id:
-            label += f" - verified (tag: {serial_scan_id})"
-        print(f"  Serial UHF:   {label}")
+        print(f"  Serial UHF:   {best['port']} @ {best['baudrate']} baud ({best['description']})")
     else:
         print("  Serial UHF:   Not found")
-
-    if wedge_scan_id:
-        print(f"  Keyboard UHF: Detected (tag: {wedge_scan_id})")
-    else:
-        print("  Keyboard UHF: Not found / skipped")
 
     if nfc_found:
         for name in nfc_found:
@@ -463,55 +275,26 @@ def main():
     config_path = find_config()
     current = read_current_config(config_path)
 
-    if not uhf_found and not wedge_scan_id:
+    if not uhf_found:
         print()
         print("No UHF reader detected - nothing to update in config.toml.")
         return
 
+    best = uhf_found[0]
     print()
     print(f"Current config.toml values:")
-    print(f'  uhf_type     = "{current["uhf_type"]}"')
     print(f'  uhf_port     = "{current["uhf_port"]}"')
     print(f'  uhf_baudrate = {current["uhf_baudrate"]}')
 
-    # Determine what to offer
-    if uhf_found and wedge_scan_id:
-        print()
-        print("Both serial and keyboard wedge UHF readers detected.")
-        print("  [1] Use serial reader")
-        print("  [2] Use keyboard wedge reader")
-        print("  [N] No changes")
-        answer = input("Choice: ").strip().lower()
-        if answer == "1":
-            best = uhf_found[0]
-            update_config(config_path, uhf_type="serial",
-                          uhf_port=best['port'], uhf_baudrate=best['baudrate'])
-            print("config.toml updated (serial mode).")
-        elif answer == "2":
-            update_config(config_path, uhf_type="keyboard")
-            print("config.toml updated (keyboard wedge mode).")
-        else:
-            print("No changes made.")
-    elif uhf_found:
-        best = uhf_found[0]
-        print()
-        print(f"Detected serial UHF: {best['port']} @ {best['baudrate']} baud")
-        answer = input("Update config.toml with detected values? [y/N]: ").strip().lower()
-        if answer == "y":
-            update_config(config_path, uhf_type="serial",
-                          uhf_port=best['port'], uhf_baudrate=best['baudrate'])
-            print("config.toml updated (serial mode).")
-        else:
-            print("No changes made.")
-    elif wedge_scan_id:
-        print()
-        print(f"Detected keyboard wedge UHF (tag: {wedge_scan_id})")
-        answer = input("Update config.toml to use keyboard wedge mode? [y/N]: ").strip().lower()
-        if answer == "y":
-            update_config(config_path, uhf_type="keyboard")
-            print("config.toml updated (keyboard wedge mode).")
-        else:
-            print("No changes made.")
+    print()
+    print(f"Detected serial UHF: {best['port']} @ {best['baudrate']} baud")
+    answer = input("Update config.toml with detected values? [y/N]: ").strip().lower()
+    if answer == "y":
+        update_config(config_path,
+                      uhf_port=best['port'], uhf_baudrate=best['baudrate'])
+        print("config.toml updated.")
+    else:
+        print("No changes made.")
 
 
 if __name__ == "__main__":

@@ -467,6 +467,21 @@ class DatabaseManager:
             print(f"[DB] Error adding hunter: {e}")
             return False
     
+    def update_hunter_name(self, uid, name):
+        """Update a hunter's name"""
+        if not self.conn:
+            return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE hunters SET name = %s WHERE uid = %s",
+                    (name, uid)
+                )
+            return True
+        except Exception as e:
+            print(f"[DB] Error updating hunter name: {e}")
+            return False
+
     def update_hunter_score(self, uid, points_to_add):
         """Add points to a hunter and update last_seen"""
         if not self.conn:
@@ -846,6 +861,25 @@ class DatabaseManager:
                 return cur.fetchall()
         except Exception as e:
             print(f"[DB] Error fetching hunter history: {e}")
+            return []
+
+    def get_wuzu_scan_history(self, epc):
+        """Get ALL scan events for a wuzu including soft-deleted (for admin view)"""
+        if not self.conn:
+            return []
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT id, timestamp, event_type, hunter_uid, details,
+                              points_awarded, deleted, deleted_by, admin_uid
+                       FROM scan_events
+                       WHERE wuzu_epc = %s
+                       ORDER BY timestamp DESC""",
+                    (epc,)
+                )
+                return cur.fetchall()
+        except Exception as e:
+            print(f"[DB] Error fetching wuzu history: {e}")
             return []
 
     # === SCAN VALIDATION ===
@@ -1649,12 +1683,13 @@ class AddHunterScreen(Screen):
 class AdminScreen(Screen):
     STATE_PASSWORD = "password"
     STATE_MENU = "menu"
-    STATE_HUNTER_HISTORY = "hunter_history"
-    STATE_DELETE_CONFIRM = "delete_confirm"
     STATE_ADJUST_SCORE = "adjust_score"
     STATE_ADD_ADMIN_SCAN = "add_admin_scan"
     STATE_ADD_ADMIN_NAME = "add_admin_name"
     STATE_ADD_ADMIN_PASSWORD = "add_admin_password"
+    STATE_EDIT_HUNTER_SCAN = "edit_hunter_scan"
+    STATE_EDIT_HUNTER_MENU = "edit_hunter_menu"
+    STATE_EDIT_HUNTER_NAME = "edit_hunter_name"
     STATE_EDIT_WUZU_SCAN = "edit_wuzu_scan"
     STATE_EDIT_WUZU_MENU = "edit_wuzu_menu"
     STATE_EDIT_WUZU_NAME = "edit_wuzu_name"
@@ -1674,14 +1709,14 @@ class AdminScreen(Screen):
         else:
             self.state = self.STATE_PASSWORD
         self.password_input = ""
-        # Hunter history state
-        self.history_hunter_uid = None
-        self.history_hunter = None
+        # Edit hunter state
+        self.edit_hunter = None
+        self.edit_hunter_input = ""
+        self.edit_hunter_error = ""
+        self.edit_hunter_scan_start = 0
         self.history_events = []
         self.selected_index = 0
         self.scroll_offset = 0
-        # Delete confirm state
-        self.delete_event = None
         # Adjust score state
         self.adjust_input = ""
         # Add admin state
@@ -1694,6 +1729,9 @@ class AdminScreen(Screen):
         self.edit_wuzu_input = ""
         self.edit_wuzu_error = ""
         self.edit_wuzu_scan_start = 0
+        self.edit_wuzu_events = []
+        self.edit_wuzu_selected_index = 0
+        self.edit_wuzu_scroll_offset = 0
         # Scan out state
         self.scan_out_found = set()
         self.scan_out_invalid = 0
@@ -1721,10 +1759,6 @@ class AdminScreen(Screen):
             self._handle_password(key)
         elif self.state == self.STATE_MENU:
             self._handle_menu(key, uid)
-        elif self.state == self.STATE_HUNTER_HISTORY:
-            self._handle_hunter_history(key, uid)
-        elif self.state == self.STATE_DELETE_CONFIRM:
-            self._handle_delete_confirm(key)
         elif self.state == self.STATE_ADJUST_SCORE:
             self._handle_adjust_score(key)
         elif self.state == self.STATE_ADD_ADMIN_SCAN:
@@ -1733,6 +1767,12 @@ class AdminScreen(Screen):
             self._handle_add_admin_name(key)
         elif self.state == self.STATE_ADD_ADMIN_PASSWORD:
             self._handle_add_admin_password(key)
+        elif self.state == self.STATE_EDIT_HUNTER_SCAN:
+            self._handle_edit_hunter_scan(key, uid)
+        elif self.state == self.STATE_EDIT_HUNTER_MENU:
+            self._handle_edit_hunter_menu(key)
+        elif self.state == self.STATE_EDIT_HUNTER_NAME:
+            self._handle_edit_hunter_name(key)
         elif self.state == self.STATE_EDIT_WUZU_SCAN:
             self._handle_edit_wuzu_scan(key)
         elif self.state == self.STATE_EDIT_WUZU_MENU:
@@ -1791,6 +1831,13 @@ class AdminScreen(Screen):
             self.edit_wuzu_scan_start = time.time()
             self.state = self.STATE_EDIT_WUZU_SCAN
             self.app.tui.force_full_redraw()
+        elif key == "h":
+            self.edit_hunter = None
+            self.edit_hunter_input = ""
+            self.edit_hunter_error = ""
+            self.edit_hunter_scan_start = time.time()
+            self.state = self.STATE_EDIT_HUNTER_SCAN
+            self.app.tui.force_full_redraw()
         elif key == "a":
             self.state = self.STATE_ADD_ADMIN_SCAN
             self.new_admin_uid = None
@@ -1807,16 +1854,6 @@ class AdminScreen(Screen):
             self.app.tui.force_full_redraw()
         elif key == "x":
             self.app.switch_screen(StartScreen(self.app))
-        elif uid:
-            # Hunter badge scanned — show their history
-            if self.app.db.hunter_exists(uid):
-                self.history_hunter_uid = uid
-                self.history_hunter = self.app.db.get_hunter(uid)
-                self.history_events = self.app.db.get_hunter_scan_history(uid)
-                self.selected_index = 0
-                self.scroll_offset = 0
-                self.state = self.STATE_HUNTER_HISTORY
-                self.app.tui.force_full_redraw()
 
     def _handle_quit_confirm(self, key):
         if key == "y" or key == "\r":
@@ -1876,67 +1913,89 @@ class AdminScreen(Screen):
 
         self.app.tui.mark_dirty(PANEL_FOOTER)
 
-    def _handle_hunter_history(self, key, uid):
+    def _handle_edit_hunter_scan(self, key, uid):
         if key == "x":
             self.state = self.STATE_MENU
             self.app.tui.force_full_redraw()
-        elif key == "d":
-            # Delete selected event
-            if self.history_events and 0 <= self.selected_index < len(self.history_events):
-                evt = self.history_events[self.selected_index]
-                if not evt.get('deleted') and evt.get('event_type') == 'SCORE':
-                    self.delete_event = evt
-                    self.state = self.STATE_DELETE_CONFIRM
-                    self.app.tui.force_full_redraw()
+            return
+
+        timeout = self.app.config.get('timing', {}).get('admin_timeout', 30)
+        if time.time() - self.edit_hunter_scan_start > timeout:
+            self.state = self.STATE_MENU
+            self.app.tui.force_full_redraw()
+            return
+
+        if uid:
+            if self.app.db.hunter_exists(uid):
+                self.edit_hunter = self.app.db.get_hunter(uid)
+                self.edit_hunter_error = ""
+                self.history_events = self.app.db.get_hunter_scan_history(uid)
+                self.selected_index = 0
+                self.scroll_offset = 0
+                self.state = self.STATE_EDIT_HUNTER_MENU
+                self.app.tui.force_full_redraw()
+            else:
+                self.edit_hunter_error = f"Hunter {uid} not found in database!"
+                self.app.tui.mark_dirty(PANEL_MAIN)
+
+    def _handle_edit_hunter_menu(self, key):
+        if key == "x":
+            self.state = self.STATE_MENU
+            self.app.tui.force_full_redraw()
+        elif key == "n":
+            self.edit_hunter_input = self.edit_hunter.get('name') or ""
+            self.state = self.STATE_EDIT_HUNTER_NAME
+            self.app.tui.force_full_redraw()
         elif key == "m":
             self.adjust_input = ""
             self.state = self.STATE_ADJUST_SCORE
             self.app.tui.force_full_redraw()
         elif key in ("j", "2"):
-            # Move selection down
             if self.selected_index < len(self.history_events) - 1:
                 self.selected_index += 1
-                self.app.tui.mark_dirty(PANEL_MAIN)
+                self.app.tui.mark_dirty(PANEL_SECONDARY)
         elif key in ("k", "8"):
-            # Move selection up
             if self.selected_index > 0:
                 self.selected_index -= 1
-                self.app.tui.mark_dirty(PANEL_MAIN)
+                self.app.tui.mark_dirty(PANEL_SECONDARY)
 
-    def _handle_delete_confirm(self, key):
-        if key == "y":
-            if self.delete_event:
-                self.app.db.soft_delete_event(self.delete_event['id'], self.admin_uid)
-                # Refresh history
-                self.history_events = self.app.db.get_hunter_scan_history(self.history_hunter_uid)
-                self.history_hunter = self.app.db.get_hunter(self.history_hunter_uid)
-                if self.selected_index >= len(self.history_events):
-                    self.selected_index = max(0, len(self.history_events) - 1)
-            self.delete_event = None
-            self.state = self.STATE_HUNTER_HISTORY
+    def _handle_edit_hunter_name(self, key):
+        if key == "x":
+            self.state = self.STATE_EDIT_HUNTER_MENU
             self.app.tui.force_full_redraw()
-        elif key == "n":
-            self.delete_event = None
-            self.state = self.STATE_HUNTER_HISTORY
+        elif key == "\r":
+            name = self.edit_hunter_input.strip()
+            if name and not self.app.db.hunter_name_exists(name):
+                uid = self.edit_hunter['uid']
+                self.app.db.update_hunter_name(uid, name)
+                self.edit_hunter = self.app.db.get_hunter(uid)
+            self.state = self.STATE_EDIT_HUNTER_MENU
             self.app.tui.force_full_redraw()
+        elif key == "\x7f" or key == "\x08":
+            self.edit_hunter_input = self.edit_hunter_input[:-1]
+            self.app.tui.mark_dirty(PANEL_MAIN)
+        elif key and (key.isalnum() or key in " -"):
+            if len(self.edit_hunter_input) < 100:
+                self.edit_hunter_input += key
+                self.app.tui.mark_dirty(PANEL_MAIN)
 
     def _handle_adjust_score(self, key):
         if key == "x":
-            self.state = self.STATE_HUNTER_HISTORY
+            self.state = self.STATE_EDIT_HUNTER_MENU
             self.app.tui.force_full_redraw()
         elif key == "\r":
             # Enter — apply adjustment
             try:
                 points = int(self.adjust_input)
                 if points != 0:
-                    self.app.db.admin_adjust_score(
-                        self.history_hunter_uid, points, self.admin_uid)
+                    uid = self.edit_hunter['uid']
+                    self.app.db.admin_adjust_score(uid, points, self.admin_uid)
                     # Refresh history and hunter data
-                    self.history_events = self.app.db.get_hunter_scan_history(self.history_hunter_uid)
-                    self.history_hunter = self.app.db.get_hunter(self.history_hunter_uid)
+                    self.history_events = self.app.db.get_hunter_scan_history(uid)
+                    self.edit_hunter = self.app.db.get_hunter(uid)
             except ValueError:
                 pass
-            self.state = self.STATE_HUNTER_HISTORY
+            self.state = self.STATE_EDIT_HUNTER_MENU
             self.app.tui.force_full_redraw()
         elif key == "\x7f" or key == "\x08":
             # Backspace
@@ -2031,6 +2090,9 @@ class AdminScreen(Screen):
             if wuzu and not wuzu.get('deleted'):
                 self.edit_wuzu = wuzu
                 self.edit_wuzu_error = ""
+                self.edit_wuzu_events = self.app.db.get_wuzu_scan_history(epc)
+                self.edit_wuzu_selected_index = 0
+                self.edit_wuzu_scroll_offset = 0
                 self.state = self.STATE_EDIT_WUZU_MENU
                 self.app.tui.force_full_redraw()
             elif wuzu and wuzu.get('deleted'):
@@ -2063,6 +2125,14 @@ class AdminScreen(Screen):
         elif key == "d":
             self.state = self.STATE_DELETE_WUZU_CONFIRM
             self.app.tui.force_full_redraw()
+        elif key in ("j", "2"):
+            if self.edit_wuzu_selected_index < len(self.edit_wuzu_events) - 1:
+                self.edit_wuzu_selected_index += 1
+                self.app.tui.mark_dirty(PANEL_SECONDARY)
+        elif key in ("k", "8"):
+            if self.edit_wuzu_selected_index > 0:
+                self.edit_wuzu_selected_index -= 1
+                self.app.tui.mark_dirty(PANEL_SECONDARY)
 
     def _handle_delete_wuzu_confirm(self, key):
         if key == "y":
@@ -2121,10 +2191,6 @@ class AdminScreen(Screen):
             self._render_password(bounded)
         elif self.state == self.STATE_MENU:
             self._render_menu(bounded)
-        elif self.state == self.STATE_HUNTER_HISTORY:
-            self._render_hunter_history(bounded)
-        elif self.state == self.STATE_DELETE_CONFIRM:
-            self._render_delete_confirm(bounded)
         elif self.state == self.STATE_ADJUST_SCORE:
             self._render_adjust_score(bounded)
         elif self.state == self.STATE_ADD_ADMIN_SCAN:
@@ -2133,6 +2199,12 @@ class AdminScreen(Screen):
             self._render_add_admin_name(bounded)
         elif self.state == self.STATE_ADD_ADMIN_PASSWORD:
             self._render_add_admin_password(bounded)
+        elif self.state == self.STATE_EDIT_HUNTER_SCAN:
+            self._render_edit_hunter_scan(bounded)
+        elif self.state == self.STATE_EDIT_HUNTER_MENU:
+            self._render_edit_hunter_menu(bounded)
+        elif self.state == self.STATE_EDIT_HUNTER_NAME:
+            self._render_edit_hunter_name(bounded)
         elif self.state == self.STATE_EDIT_WUZU_SCAN:
             self._render_edit_wuzu_scan(bounded)
         elif self.state == self.STATE_EDIT_WUZU_MENU:
@@ -2168,10 +2240,9 @@ class AdminScreen(Screen):
 
         bounded.print_centered(start_row, "ADMIN FUNCTIONS")
         bounded.print_centered(start_row + 2, "[W] Add Wuzu Tag       [E] Edit Wuzu")
-        bounded.print_centered(start_row + 3, "[A] Add New Admin      [O] Override Scan")
-        bounded.print_centered(start_row + 4, "[S] Scan Out Wuzus")
+        bounded.print_centered(start_row + 3, "[H] Edit Hunter        [A] Add New Admin")
+        bounded.print_centered(start_row + 4, "[O] Override Scan      [S] Scan Out Wuzus")
         bounded.print_centered(start_row + 5, "[Q] Quit Application   [X] Exit Admin Mode")
-        bounded.print_centered(start_row + 7, "Scan hunter badge to view/edit history...")
 
     def _render_quit_confirm(self, bounded):
         bounded.set_title("QUIT APPLICATION")
@@ -2200,56 +2271,52 @@ class AdminScreen(Screen):
         if self.scan_out_invalid > 0:
             bounded.print_centered(start_row + 5, f"Invalid: {self.scan_out_invalid}")
 
-    def _render_hunter_history(self, bounded):
-        hunter_name = self.history_hunter.get('name', '?') if self.history_hunter else '?'
-        hunter_pts = self.history_hunter.get('points', 0) if self.history_hunter else 0
-        bounded.set_title(f"HUNTER: {hunter_name} ({hunter_pts}pts)")
-
-        content_cols, content_rows = bounded.content_size()
-
-        # Header
-        header = f"{'#':<4} {'TIME':<10} {'TYPE':<12} {'PTS':<6} {'DETAILS':<30} {'STATUS'}"
-        bounded.print_content(1, header)
-        bounded.print_content(2, "-" * min(content_cols, 80))
-
-        # Visible rows
-        visible_rows = content_rows - 4
-        # Adjust scroll to keep selection visible
-        if self.selected_index < self.scroll_offset:
-            self.scroll_offset = self.selected_index
-        elif self.selected_index >= self.scroll_offset + visible_rows:
-            self.scroll_offset = self.selected_index - visible_rows + 1
-
-        for i, evt in enumerate(self.history_events[self.scroll_offset:self.scroll_offset + visible_rows]):
-            actual_idx = self.scroll_offset + i
-            ts = evt['timestamp'].strftime("%H:%M:%S")
-            pts = evt.get('points_awarded', 0)
-            details = (evt.get('details', '') or '')[:30]
-            status = "[DELETED]" if evt.get('deleted') else ""
-            marker = "> " if actual_idx == self.selected_index else "  "
-            row = f"{marker}{actual_idx + 1:<2} {ts:<10} {evt['event_type']:<12} {pts:<6} {details:<30} {status}"
-            bounded.print_content(3 + i, row[:content_cols])
-
-    def _render_delete_confirm(self, bounded):
-        bounded.set_title("CONFIRM DELETE")
+    def _render_edit_hunter_scan(self, bounded):
+        bounded.set_title("EDIT HUNTER")
         content_cols, content_rows = bounded.content_size()
         start_row = (content_rows - 6) // 2 + 1
 
-        if self.delete_event:
-            ts = self.delete_event['timestamp'].strftime("%H:%M:%S")
-            pts = self.delete_event.get('points_awarded', 0)
-            details = self.delete_event.get('details', '') or ''
-            bounded.print_centered(start_row, f"Event: {ts} - {details}")
-            bounded.print_centered(start_row + 1, f"Points: {pts}")
-            bounded.print_centered(start_row + 3, "Delete this event and remove points?")
-            bounded.print_centered(start_row + 5, "[Y] Yes    [N] No")
+        timeout = self.app.config.get('timing', {}).get('admin_timeout', 30)
+        left = max(0, int(timeout - (time.time() - self.edit_hunter_scan_start)))
+        bounded.print_centered(start_row, "Scan hunter badge with NFC reader...")
+        bounded.print_centered(start_row + 2, f"Timeout in {left} seconds")
+        if self.edit_hunter_error:
+            bounded.print_centered(start_row + 4, f"ERROR: {self.edit_hunter_error}")
+
+    def _render_edit_hunter_menu(self, bounded):
+        bounded.set_title("EDIT HUNTER")
+
+        hunter = self.edit_hunter
+        hunter_name = hunter.get('name', '?') if hunter else '?'
+        hunter_pts = hunter.get('points', 0) if hunter else 0
+        hunter_uid = hunter.get('uid', '?') if hunter else '?'
+        last_seen = hunter.get('last_seen')
+        last_seen_str = last_seen.strftime("%Y-%m-%d %H:%M:%S") if last_seen else "(never)"
+
+        bounded.print_content(1, f"UID:       {hunter_uid}")
+        bounded.print_content(2, f"Name:      {hunter_name}")
+        bounded.print_content(3, f"Points:    {hunter_pts}")
+        bounded.print_content(4, f"Last Seen: {last_seen_str}")
+        bounded.print_content(6, "[N] Edit Name   [M] Manual Adjust")
+        bounded.print_content(7, "[X] Back to Admin Menu")
+
+    def _render_edit_hunter_name(self, bounded):
+        bounded.set_title("EDIT HUNTER - NAME")
+        content_cols, content_rows = bounded.content_size()
+        start_row = (content_rows - 6) // 2 + 1
+
+        hunter_name = self.edit_hunter.get('name', '?') if self.edit_hunter else '?'
+        bounded.print_centered(start_row, f"Hunter: {hunter_name}")
+        bounded.print_centered(start_row + 2, "Enter new name:")
+        bounded.print_centered(start_row + 3, f"> {self.edit_hunter_input}_")
+        bounded.print_centered(start_row + 5, "[Enter] Save    [X] Cancel")
 
     def _render_adjust_score(self, bounded):
         bounded.set_title("MANUAL SCORE ADJUSTMENT")
         content_cols, content_rows = bounded.content_size()
         start_row = (content_rows - 6) // 2 + 1
 
-        hunter_name = self.history_hunter.get('name', '?') if self.history_hunter else '?'
+        hunter_name = self.edit_hunter.get('name', '?') if self.edit_hunter else '?'
         bounded.print_centered(start_row, f"Hunter: {hunter_name}")
         bounded.print_centered(start_row + 2, "Enter point adjustment (e.g. 10 or -5):")
         bounded.print_centered(start_row + 3, f"> {self.adjust_input}_")
@@ -2342,7 +2409,17 @@ class AdminScreen(Screen):
         bounded.print_centered(start_row + 5, "[Enter] Save    [X] Cancel")
 
     def render_secondary(self, bounded, app_state):
-        """Show all recent events"""
+        if self.state in (self.STATE_EDIT_HUNTER_MENU, self.STATE_EDIT_HUNTER_NAME,
+                          self.STATE_ADJUST_SCORE):
+            self._render_hunter_history_panel(bounded)
+        elif self.state in (self.STATE_EDIT_WUZU_MENU, self.STATE_EDIT_WUZU_NAME,
+                            self.STATE_EDIT_WUZU_POINTS, self.STATE_EDIT_WUZU_FACT,
+                            self.STATE_DELETE_WUZU_CONFIRM):
+            self._render_wuzu_history_panel(bounded)
+        else:
+            self._render_all_events(bounded)
+
+    def _render_all_events(self, bounded):
         bounded.set_title("ALL EVENTS")
         content_cols, content_rows = bounded.content_size()
         events = self.app.db.get_all_recent_events(content_rows - 1)
@@ -2353,16 +2430,74 @@ class AdminScreen(Screen):
             line = f"{ts} {evt['event_type']:<20} {prefix}{evt.get('details', '')}"
             bounded.print_content(i, line[:content_cols])
 
+    def _render_hunter_history_panel(self, bounded):
+        hunter_name = self.edit_hunter.get('name', '?') if self.edit_hunter else '?'
+        bounded.set_title(f"SCAN HISTORY - {hunter_name}")
+        content_cols, content_rows = bounded.content_size()
+
+        # Header
+        detail_width = max(content_cols - 44, 10)
+        header = f"{'#':<4} {'TIME':<10} {'TYPE':<12} {'PTS':<6} {'DETAILS':<{detail_width}} {'STATUS'}"
+        bounded.print_content(1, header[:content_cols])
+        bounded.print_content(2, "-" * content_cols)
+
+        # Visible rows
+        visible_rows = content_rows - 2
+        if self.selected_index < self.scroll_offset:
+            self.scroll_offset = self.selected_index
+        elif self.selected_index >= self.scroll_offset + visible_rows:
+            self.scroll_offset = self.selected_index - visible_rows + 1
+
+        for i, evt in enumerate(self.history_events[self.scroll_offset:self.scroll_offset + visible_rows]):
+            actual_idx = self.scroll_offset + i
+            ts = evt['timestamp'].strftime("%H:%M:%S")
+            pts = evt.get('points_awarded', 0)
+            details = (evt.get('details', '') or '')[:detail_width]
+            status = "[DELETED]" if evt.get('deleted') else ""
+            marker = "> " if actual_idx == self.selected_index else "  "
+            row = f"{marker}{actual_idx + 1:<2} {ts:<10} {evt['event_type']:<12} {pts:<6} {details:<{detail_width}} {status}"
+            bounded.print_content(3 + i, row[:content_cols])
+
+    def _render_wuzu_history_panel(self, bounded):
+        wuzu_name = self.edit_wuzu.get('name') or self.edit_wuzu.get('epc', '?') if self.edit_wuzu else '?'
+        bounded.set_title(f"SCAN HISTORY - {wuzu_name}")
+        content_cols, content_rows = bounded.content_size()
+
+        # Header
+        detail_width = max(content_cols - 44, 10)
+        header = f"{'#':<4} {'TIME':<10} {'TYPE':<12} {'PTS':<6} {'DETAILS':<{detail_width}} {'STATUS'}"
+        bounded.print_content(1, header[:content_cols])
+        bounded.print_content(2, "-" * content_cols)
+
+        # Visible rows
+        visible_rows = content_rows - 2
+        if self.edit_wuzu_selected_index < self.edit_wuzu_scroll_offset:
+            self.edit_wuzu_scroll_offset = self.edit_wuzu_selected_index
+        elif self.edit_wuzu_selected_index >= self.edit_wuzu_scroll_offset + visible_rows:
+            self.edit_wuzu_scroll_offset = self.edit_wuzu_selected_index - visible_rows + 1
+
+        for i, evt in enumerate(self.edit_wuzu_events[self.edit_wuzu_scroll_offset:self.edit_wuzu_scroll_offset + visible_rows]):
+            actual_idx = self.edit_wuzu_scroll_offset + i
+            ts = evt['timestamp'].strftime("%H:%M:%S")
+            pts = evt.get('points_awarded', 0)
+            details = (evt.get('details', '') or '')[:detail_width]
+            status = "[DELETED]" if evt.get('deleted') else ""
+            marker = "> " if actual_idx == self.edit_wuzu_selected_index else "  "
+            row = f"{marker}{actual_idx + 1:<2} {ts:<10} {evt['event_type']:<12} {pts:<6} {details:<{detail_width}} {status}"
+            bounded.print_content(3 + i, row[:content_cols])
+
     def render_footer(self, bounded, app_state):
         bounded.set_title("ADMIN CONTROLS")
         if self.state == self.STATE_PASSWORD:
             bounded.print_content(1, "[Enter] Submit  [X] Cancel")
         elif self.state == self.STATE_MENU:
-            bounded.print_content(1, "[W] Wuzu [E] Edit [A] Admin [O] Override [S] Scan Out [Q] Quit [X] Exit")
-        elif self.state == self.STATE_HUNTER_HISTORY:
-            bounded.print_content(1, "[J/K] Navigate  [D] Delete Selected  [M] Manual Adjust  [X] Back")
-        elif self.state == self.STATE_DELETE_CONFIRM:
-            bounded.print_content(1, "[Y] Confirm Delete  [N] Cancel")
+            bounded.print_content(1, "[W] Wuzu [E] Edit [H] Hunter [A] Admin [O] Override [S] Scan Out [Q] Quit [X] Exit")
+        elif self.state == self.STATE_EDIT_HUNTER_SCAN:
+            bounded.print_content(1, "[X] Cancel")
+        elif self.state == self.STATE_EDIT_HUNTER_MENU:
+            bounded.print_content(1, "[N] Edit Name  [M] Manual Adjust  [J/K] Navigate History  [X] Back")
+        elif self.state == self.STATE_EDIT_HUNTER_NAME:
+            bounded.print_content(1, "[Enter] Save  [X] Cancel")
         elif self.state == self.STATE_ADJUST_SCORE:
             bounded.print_content(1, "[Enter] Apply  [X] Cancel")
         elif self.state in (self.STATE_ADD_ADMIN_SCAN, self.STATE_ADD_ADMIN_NAME,
@@ -2371,7 +2506,7 @@ class AdminScreen(Screen):
         elif self.state == self.STATE_EDIT_WUZU_SCAN:
             bounded.print_content(1, "[X] Cancel")
         elif self.state == self.STATE_EDIT_WUZU_MENU:
-            bounded.print_content(1, "[N] Name  [P] Points  [F] Fact  [D] Delete  [X] Back")
+            bounded.print_content(1, "[N] Name  [P] Points  [F] Fact  [D] Delete  [J/K] Navigate History  [X] Back")
         elif self.state in (self.STATE_EDIT_WUZU_NAME, self.STATE_EDIT_WUZU_POINTS,
                             self.STATE_EDIT_WUZU_FACT):
             bounded.print_content(1, "[Enter] Save  [X] Cancel")

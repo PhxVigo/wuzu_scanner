@@ -1321,21 +1321,24 @@ class Screen:
     def render_status_bar(self, bounded, app_state):
         """Render the status bar - same for all screens"""
         cols, _ = bounded.size()
-        
+
         uptime = format_uptime(time.time() - app_state["start"])
         now = time.strftime("%H:%M:%S")
-        
-        recent = self.app.db.get_recent_events(1)
-        last_scan = recent[0]['timestamp'].strftime("%H:%M:%S") if recent else "--:--:--"
-        
+
         db_status = self.app.db_status
-        #status_bar = f"╒═╡ DB:{db_status} - UPTIME:{uptime} - LAST-SCAN:{last_scan} - TIME:{now} ╞═"
-        #status_bar += "═" * (cols - len(status_bar) - 1) + "╕"
-        
-        status_bar = f"═╡ DB:{db_status} - UPTIME:{uptime} - LAST-SCAN:{last_scan} - TIME:{now} ╞═"
-        status_bar = "╘" + "═" * (cols - len(status_bar) - 2) + status_bar + "╛"
-        
-        # Just print the status text, no borders
+
+        right_part = f"═╡ DB:{db_status} - UPTIME:{uptime} - TIME:{now} ╞═╛"
+
+        timeout_info = self.get_active_timeout()
+        if timeout_info:
+            label, remaining = timeout_info
+            left_part = f"╘═╡ {label}: {remaining}s ╞"
+        else:
+            left_part = "╘"
+
+        fill_len = max(0, cols - len(left_part) - len(right_part))
+        status_bar = left_part + "═" * fill_len + right_part
+
         bounded.print_row(0, status_bar)
 
     # -------------------------------------------------------------------------
@@ -1358,6 +1361,10 @@ class Screen:
     def render_footer(self, bounded, app_state):
         """Override this to render footer controls"""
         bounded.set_title(PANEL_FOOTER)
+
+    def get_active_timeout(self):
+        """Return (label, remaining_seconds) or None if no active timeout."""
+        return None
 
     # Default no-op handler
     def handle(self, key, uid):
@@ -1387,6 +1394,12 @@ class StartScreen(Screen):
             'main': 16,
             'secondary': available_rows - 16
         }
+
+    def get_active_timeout(self):
+        if self.state == self.STATE_UNKNOWN_PROMPT and self.unknown_prompt_time:
+            left = max(0, int(self.unknown_tag_timeout - (time.time() - self.unknown_prompt_time)))
+            return ("UNKNOWN TAG", left)
+        return None
 
     def handle(self, key, uid):
         if key or uid:
@@ -1587,11 +1600,15 @@ class AddHunterScreen(Screen):
         }
 
     def handle(self, key, uid):
+        if key == "r" and self.state in (self.STATE_SCAN, self.STATE_CONFIRM):
+            self.app.tui.force_full_redraw()
+            return
+
         if self.state == self.STATE_SCAN:
             if key == "x":
                 self.app.log_event("CANCEL", details="Add-Hunter cancelled")
                 self.app.switch_screen(StartScreen(self.app))
-                return            
+                return
             if uid:
                 if self.app.db.admin_exists(uid):
                     self.error_msg = "This badge is registered as an admin!"
@@ -1742,9 +1759,27 @@ class AdminScreen(Screen):
 
     def get_panel_sizes(self, available_rows):
         return {
-            'main': 16,
-            'secondary': available_rows - 16
+            'main': 11,
+            'secondary': available_rows - 11
         }
+
+    def get_active_timeout(self):
+        if self.state == self.STATE_PASSWORD:
+            return None
+        if self.state == self.STATE_EDIT_HUNTER_SCAN:
+            timeout = self.app.config.get('timing', {}).get('admin_timeout', 30)
+            left = max(0, int(timeout - (time.time() - self.edit_hunter_scan_start)))
+            return ("EDIT HUNTER SCAN", left)
+        elif self.state == self.STATE_EDIT_WUZU_SCAN:
+            timeout = self.app.config.get('timing', {}).get('scan_timeout', 10)
+            left = max(0, int(timeout - (time.time() - self.edit_wuzu_scan_start)))
+            return ("EDIT WUZU SCAN", left)
+        elif self.state == self.STATE_SCAN_OUT:
+            timeout = self.app.config.get('timing', {}).get('scan_timeout', 5)
+            left = max(0, int(timeout - (time.time() - self.scan_out_last_time)))
+            return ("SCAN OUT", left)
+        left = max(0, int(self.admin_timeout - (time.time() - self.last_activity)))
+        return ("ADMIN SESSION", left)
 
     def handle(self, key, uid):
         if key or uid:
@@ -1753,6 +1788,15 @@ class AdminScreen(Screen):
         # Check idle timeout
         if self.state != self.STATE_PASSWORD and time.time() - self.last_activity > self.admin_timeout:
             self.app.switch_screen(StartScreen(self.app))
+            return
+
+        if key == "r" and self.state not in (
+            self.STATE_PASSWORD, self.STATE_ADJUST_SCORE,
+            self.STATE_ADD_ADMIN_NAME, self.STATE_ADD_ADMIN_PASSWORD,
+            self.STATE_EDIT_HUNTER_NAME, self.STATE_EDIT_WUZU_NAME,
+            self.STATE_EDIT_WUZU_POINTS, self.STATE_EDIT_WUZU_FACT,
+        ):
+            self.app.tui.force_full_redraw()
             return
 
         if self.state == self.STATE_PASSWORD:
@@ -2276,10 +2320,7 @@ class AdminScreen(Screen):
         content_cols, content_rows = bounded.content_size()
         start_row = (content_rows - 6) // 2 + 1
 
-        timeout = self.app.config.get('timing', {}).get('admin_timeout', 30)
-        left = max(0, int(timeout - (time.time() - self.edit_hunter_scan_start)))
         bounded.print_centered(start_row, "Scan hunter badge with NFC reader...")
-        bounded.print_centered(start_row + 2, f"Timeout in {left} seconds")
         if self.edit_hunter_error:
             bounded.print_centered(start_row + 4, f"ERROR: {self.edit_hunter_error}")
 
@@ -2358,10 +2399,7 @@ class AdminScreen(Screen):
         content_cols, content_rows = bounded.content_size()
         start_row = (content_rows - 6) // 2 + 1
 
-        timeout = self.app.config.get('timing', {}).get('scan_timeout', 10)
-        left = max(0, int(timeout - (time.time() - self.edit_wuzu_scan_start)))
         bounded.print_centered(start_row, "Scan Wuzu tag with UHF reader...")
-        bounded.print_centered(start_row + 2, f"Timeout in {left} seconds")
         if self.edit_wuzu_error:
             bounded.print_centered(start_row + 4, f"ERROR: {self.edit_wuzu_error}")
 
@@ -2436,8 +2474,8 @@ class AdminScreen(Screen):
         content_cols, content_rows = bounded.content_size()
 
         # Header
-        detail_width = max(content_cols - 44, 10)
-        header = f"{'#':<4} {'TIME':<10} {'TYPE':<12} {'PTS':<6} {'DETAILS':<{detail_width}} {'STATUS'}"
+        detail_width = max(content_cols - 34, 10)
+        header = f"{'#':<4} {'TIME':<10} {'TYPE':<12} {'PTS':<6} {'DETAILS'}"
         bounded.print_content(1, header[:content_cols])
         bounded.print_content(2, "-" * content_cols)
 
@@ -2453,9 +2491,8 @@ class AdminScreen(Screen):
             ts = evt['timestamp'].strftime("%H:%M:%S")
             pts = evt.get('points_awarded', 0)
             details = (evt.get('details', '') or '')[:detail_width]
-            status = "[DELETED]" if evt.get('deleted') else ""
             marker = "> " if actual_idx == self.selected_index else "  "
-            row = f"{marker}{actual_idx + 1:<2} {ts:<10} {evt['event_type']:<12} {pts:<6} {details:<{detail_width}} {status}"
+            row = f"{marker}{actual_idx + 1:<2} {ts:<10} {evt['event_type']:<12} {pts:<6} {details}"
             bounded.print_content(3 + i, row[:content_cols])
 
     def _render_wuzu_history_panel(self, bounded):
@@ -2464,8 +2501,8 @@ class AdminScreen(Screen):
         content_cols, content_rows = bounded.content_size()
 
         # Header
-        detail_width = max(content_cols - 44, 10)
-        header = f"{'#':<4} {'TIME':<10} {'TYPE':<12} {'PTS':<6} {'DETAILS':<{detail_width}} {'STATUS'}"
+        detail_width = max(content_cols - 34, 10)
+        header = f"{'#':<4} {'TIME':<10} {'TYPE':<12} {'PTS':<6} {'DETAILS'}"
         bounded.print_content(1, header[:content_cols])
         bounded.print_content(2, "-" * content_cols)
 
@@ -2481,9 +2518,8 @@ class AdminScreen(Screen):
             ts = evt['timestamp'].strftime("%H:%M:%S")
             pts = evt.get('points_awarded', 0)
             details = (evt.get('details', '') or '')[:detail_width]
-            status = "[DELETED]" if evt.get('deleted') else ""
             marker = "> " if actual_idx == self.edit_wuzu_selected_index else "  "
-            row = f"{marker}{actual_idx + 1:<2} {ts:<10} {evt['event_type']:<12} {pts:<6} {details:<{detail_width}} {status}"
+            row = f"{marker}{actual_idx + 1:<2} {ts:<10} {evt['event_type']:<12} {pts:<6} {details}"
             bounded.print_content(3 + i, row[:content_cols])
 
     def render_footer(self, bounded, app_state):
@@ -2515,8 +2551,7 @@ class AdminScreen(Screen):
         elif self.state == self.STATE_OVERRIDE_SCAN_BADGE:
             bounded.print_content(1, "Scan hunter badge...  [X] Cancel")
         elif self.state == self.STATE_SCAN_OUT:
-            left = max(0, int(self.app.config.get('timing', {}).get('scan_timeout', 5) - (time.time() - self.scan_out_last_time)))
-            bounded.print_content(1, f"Scanning out wuzus...  Time remaining: {left}s  [X] Exit")
+            bounded.print_content(1, "Scanning out wuzus...  [X] Exit")
 
 
 # =============================================================================
@@ -2543,7 +2578,17 @@ class AddWuzuScreen(Screen):
             'secondary': None
         }
 
+    def get_active_timeout(self):
+        if self.state == self.STATE_SCAN:
+            left = max(0, int(self.timeout - (time.time() - self.start_time)))
+            return ("ADD WUZU SCAN", left)
+        return None
+
     def handle(self, key, uid):
+        if key == "r" and self.state in (self.STATE_SCAN, self.STATE_READD_CONFIRM):
+            self.app.tui.force_full_redraw()
+            return
+
         if self.state == self.STATE_SCAN:
             if time.time() - self.start_time > self.timeout:
                 self.app.log_event("TIMEOUT", details="Add-Wuzu: no scan", private=True)
@@ -2602,10 +2647,7 @@ class AddWuzuScreen(Screen):
         
         if self.state == self.STATE_SCAN:
             bounded.set_title("ADD NEW WUZU")
-            left = max(0, int(self.timeout - (time.time() - self.start_time)))
-            
             bounded.print_centered(start_row + 1, "Scanning for UHF tags...")
-            bounded.print_centered(start_row + 3, f"Timeout in {left} seconds")
         
         elif self.state == self.STATE_READD_CONFIRM:
             bounded.set_title("ADD NEW WUZU")
@@ -2656,7 +2698,15 @@ class ScanWuzuScreen(Screen):
             'secondary': None
         }
 
+    def get_active_timeout(self):
+        left = max(0, int(self.timeout - (time.time() - self.last_time)))
+        return ("SCORING", left)
+
     def handle(self, key, uid):
+        if key == "r":
+            self.app.tui.force_full_redraw()
+            return
+
         if key == "x":
             hunter = self.app.db.get_hunter(self.hunter_uid)
             name = hunter['name'] if hunter else "Unknown"
@@ -2755,12 +2805,10 @@ class ScanWuzuScreen(Screen):
             bounded.print_centered(start_row + row, f"{len(self.rejected)} {rejected_label}")
 
     def render_footer(self, bounded, app_state):
-        left = max(0, int(self.timeout - (time.time() - self.last_time)))
-
         title = "OVERRIDE MODE" if self.override else "SCORING MODE"
         bounded.set_title(title)
         bounded.print_content(1, "Scan Wuzus to score points!")
-        bounded.print_content(2, f"Time remaining: {left}s  [X] Exit")
+        bounded.print_content(2, "[X] Exit")
 
 
 # =============================================================================
@@ -2787,7 +2835,16 @@ class ResultsScreen(Screen):
             'secondary': None
         }
 
+    def get_active_timeout(self):
+        elapsed = time.time() - self.start_time
+        left = max(0, int(self.timeout - elapsed))
+        return ("RESULTS", left)
+
     def handle(self, key, uid):
+        if key == "r":
+            self.app.tui.force_full_redraw()
+            return
+
         # Calculate remaining time based on actual elapsed time
         elapsed = time.time() - self.start_time
         remaining = max(0, self.timeout - elapsed)
@@ -2845,12 +2902,8 @@ class ResultsScreen(Screen):
         bounded.print_centered(start_row + row + 3, rank_text)
 
     def render_footer(self, bounded, app_state):
-        # Calculate remaining time for display
-        elapsed = time.time() - self.start_time
-        remaining = max(0, int(self.timeout - elapsed))
-        
         bounded.set_title("RESULTS")
-        bounded.print_content(1, f"Returning to main screen in {remaining}s...")
+        bounded.print_content(1, "Returning to main screen...")
         bounded.print_content(2, "[X] Return now")
 
 

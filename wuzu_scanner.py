@@ -5,6 +5,7 @@ With Bounded Terminal Panel System and Dynamic Panel Sizing
 """
 
 import sys, time, shutil, os, platform, random
+from datetime import datetime, timedelta
 from collections import deque
 
 # =============================================================================
@@ -847,6 +848,82 @@ class DatabaseManager:
             print(f"[DB] Error fetching hunter history: {e}")
             return []
 
+    # === SCAN VALIDATION ===
+    def get_last_wuzu_event(self, epc, event_type):
+        """Get most recent non-deleted event of given type for a wuzu EPC"""
+        if not self.conn:
+            return None
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT id, timestamp, hunter_uid, event_type, points_awarded
+                       FROM scan_events
+                       WHERE wuzu_epc = %s AND event_type = %s AND deleted = FALSE
+                       ORDER BY timestamp DESC
+                       LIMIT 1""",
+                    (epc, event_type)
+                )
+                return cur.fetchone()
+        except Exception as e:
+            print(f"[DB] Error fetching last wuzu event: {e}")
+            return None
+
+    def get_last_wuzu_score_event(self, epc):
+        """Get most recent non-deleted SCORE or OVERRIDE_SCORE event for a wuzu EPC"""
+        if not self.conn:
+            return None
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT id, timestamp, hunter_uid, event_type, points_awarded
+                       FROM scan_events
+                       WHERE wuzu_epc = %s AND event_type IN ('SCORE', 'OVERRIDE_SCORE')
+                             AND deleted = FALSE
+                       ORDER BY timestamp DESC
+                       LIMIT 1""",
+                    (epc,)
+                )
+                return cur.fetchone()
+        except Exception as e:
+            print(f"[DB] Error fetching last wuzu score event: {e}")
+            return None
+
+    def check_wuzu_scan_validity(self, epc, scoring_config):
+        """Check if a wuzu scan is valid based on cooldown and scan-out rules.
+        Returns (valid: bool, reason: str)"""
+        cooldown_minutes = scoring_config.get('cooldown_minutes', 1)
+        scan_out_enabled = scoring_config.get('scan_out', False)
+        cooldown_overrides = scoring_config.get('cooldown_overrides_scan_out', False)
+
+        last_score = self.get_last_wuzu_score_event(epc)
+        last_scan_out = self.get_last_wuzu_event(epc, 'SCAN_OUT')
+
+        # Valid scan-out: exists and is more recent than last score
+        has_valid_scan_out = (
+            last_scan_out is not None and
+            (last_score is None or last_scan_out['timestamp'] > last_score['timestamp'])
+        )
+
+        # Cooldown check
+        if cooldown_minutes == 0 or last_score is None:
+            cooldown_expired = True
+        else:
+            elapsed = datetime.now() - last_score['timestamp']
+            cooldown_expired = elapsed.total_seconds() >= cooldown_minutes * 60
+
+        if scan_out_enabled:
+            if has_valid_scan_out:
+                return (True, "")
+            if cooldown_overrides and cooldown_expired:
+                return (True, "")
+            return (False, "Scan-out required")
+        else:
+            if has_valid_scan_out:
+                return (True, "")
+            if cooldown_expired:
+                return (True, "")
+            return (False, "Rescan cooldown active")
+
     def soft_delete_event(self, event_id, admin_uid):
         """Soft delete a scan event and adjust hunter score atomically"""
         if not self.conn:
@@ -1585,6 +1662,8 @@ class AdminScreen(Screen):
     STATE_EDIT_WUZU_FACT = "edit_wuzu_fact"
     STATE_DELETE_WUZU_CONFIRM = "delete_wuzu_confirm"
     STATE_QUIT_CONFIRM = "quit_confirm"
+    STATE_OVERRIDE_SCAN_BADGE = "override_scan_badge"
+    STATE_SCAN_OUT = "scan_out"
 
     def __init__(self, app, admin_uid):
         super().__init__(app)
@@ -1615,6 +1694,10 @@ class AdminScreen(Screen):
         self.edit_wuzu_input = ""
         self.edit_wuzu_error = ""
         self.edit_wuzu_scan_start = 0
+        # Scan out state
+        self.scan_out_found = set()
+        self.scan_out_invalid = 0
+        self.scan_out_last_time = 0
         # Idle timeout
         self.last_activity = time.time()
         self.admin_timeout = app.config.get('timing', {}).get('admin_timeout', 30)
@@ -1664,6 +1747,10 @@ class AdminScreen(Screen):
             self._handle_delete_wuzu_confirm(key)
         elif self.state == self.STATE_QUIT_CONFIRM:
             self._handle_quit_confirm(key)
+        elif self.state == self.STATE_OVERRIDE_SCAN_BADGE:
+            self._handle_override_scan_badge(key, uid)
+        elif self.state == self.STATE_SCAN_OUT:
+            self._handle_scan_out(key)
 
     def _handle_password(self, key):
         if key == "x":
@@ -1709,6 +1796,15 @@ class AdminScreen(Screen):
             self.new_admin_uid = None
             self.new_admin_name = ""
             self.app.tui.force_full_redraw()
+        elif key == "o":
+            self.state = self.STATE_OVERRIDE_SCAN_BADGE
+            self.app.tui.force_full_redraw()
+        elif key == "s":
+            self.scan_out_found = set()
+            self.scan_out_invalid = 0
+            self.scan_out_last_time = time.time()
+            self.state = self.STATE_SCAN_OUT
+            self.app.tui.force_full_redraw()
         elif key == "x":
             self.app.switch_screen(StartScreen(self.app))
         elif uid:
@@ -1732,6 +1828,53 @@ class AdminScreen(Screen):
         elif key and key != "y":
             self.state = self.STATE_MENU
             self.app.tui.force_full_redraw()
+
+    def _handle_override_scan_badge(self, key, uid):
+        if key == "x":
+            self.state = self.STATE_MENU
+            self.app.tui.force_full_redraw()
+        elif uid:
+            if self.app.db.hunter_exists(uid):
+                hunter = self.app.db.get_hunter(uid)
+                admin_name = self.admin.get('name', self.admin_uid) if self.admin else self.admin_uid
+                self.app.log_event("ADMIN_OVERRIDE", hunter_uid=uid,
+                    details=f"Admin {admin_name} started override scan for {hunter['name']}")
+                self.app.switch_screen(ScanWuzuScreen(self.app, uid, override=True))
+
+    def _handle_scan_out(self, key):
+        if key == "x":
+            self.state = self.STATE_MENU
+            self.app.tui.force_full_redraw()
+            return
+
+        timeout = self.app.config.get('timing', {}).get('scan_timeout', 5)
+        if time.time() - self.scan_out_last_time > timeout:
+            self.state = self.STATE_MENU
+            self.app.tui.force_full_redraw()
+            return
+
+        tags = self.app.uhf.inventory()
+        for tag in tags:
+            epc = tag["epc"]
+            if epc in self.scan_out_found:
+                continue
+            wuzu = self.app.db.get_wuzu(epc)
+            if wuzu and not wuzu.get('deleted'):
+                self.scan_out_found.add(epc)
+                self.scan_out_last_time = time.time()
+                wuzu_name = wuzu.get('name') or epc
+                admin_name = self.admin.get('name', self.admin_uid) if self.admin else self.admin_uid
+                self.app.log_event("SCAN_OUT", wuzu_epc=epc,
+                    details=f"Admin {admin_name} scanned out {wuzu_name}",
+                    private=True)
+                self.app.beep("new_wuzu")
+                self.app.tui.mark_dirty(PANEL_MAIN)
+            else:
+                self.scan_out_invalid += 1
+                self.scan_out_last_time = time.time()
+                self.app.tui.mark_dirty(PANEL_MAIN)
+
+        self.app.tui.mark_dirty(PANEL_FOOTER)
 
     def _handle_hunter_history(self, key, uid):
         if key == "x":
@@ -2000,6 +2143,10 @@ class AdminScreen(Screen):
             self._render_delete_wuzu_confirm(bounded)
         elif self.state == self.STATE_QUIT_CONFIRM:
             self._render_quit_confirm(bounded)
+        elif self.state == self.STATE_OVERRIDE_SCAN_BADGE:
+            self._render_override_scan_badge(bounded)
+        elif self.state == self.STATE_SCAN_OUT:
+            self._render_scan_out(bounded)
 
     def _render_password(self, bounded):
         admin_name = self.admin.get('name', self.admin_uid) if self.admin else self.admin_uid
@@ -2017,13 +2164,14 @@ class AdminScreen(Screen):
         admin_name = self.admin.get('name', self.admin_uid) if self.admin else self.admin_uid
         bounded.set_title(f"ADMIN PANEL - {admin_name}")
         content_cols, content_rows = bounded.content_size()
-        start_row = (content_rows - 8) // 2 + 1
+        start_row = (content_rows - 10) // 2 + 1
 
         bounded.print_centered(start_row, "ADMIN FUNCTIONS")
         bounded.print_centered(start_row + 2, "[W] Add Wuzu Tag       [E] Edit Wuzu")
-        bounded.print_centered(start_row + 3, "[A] Add New Admin")
-        bounded.print_centered(start_row + 4, "[Q] Quit Application   [X] Exit Admin Mode")
-        bounded.print_centered(start_row + 6, "Scan hunter badge to view/edit history...")
+        bounded.print_centered(start_row + 3, "[A] Add New Admin      [O] Override Scan")
+        bounded.print_centered(start_row + 4, "[S] Scan Out Wuzus")
+        bounded.print_centered(start_row + 5, "[Q] Quit Application   [X] Exit Admin Mode")
+        bounded.print_centered(start_row + 7, "Scan hunter badge to view/edit history...")
 
     def _render_quit_confirm(self, bounded):
         bounded.set_title("QUIT APPLICATION")
@@ -2031,6 +2179,26 @@ class AdminScreen(Screen):
         start_row = (content_rows - 4) // 2 + 1
         bounded.print_centered(start_row, "Quit application, Are you sure?")
         bounded.print_centered(start_row + 2, "[Y/n]")
+
+    def _render_override_scan_badge(self, bounded):
+        bounded.set_title("OVERRIDE SCAN")
+        content_cols, content_rows = bounded.content_size()
+        start_row = (content_rows - 6) // 2 + 1
+        bounded.print_centered(start_row, "ADMIN OVERRIDE SCAN")
+        bounded.print_centered(start_row + 2, "Scan hunter badge to begin...")
+        bounded.print_centered(start_row + 4, "All validation will be skipped!")
+        bounded.print_centered(start_row + 5, "[X] Cancel")
+
+    def _render_scan_out(self, bounded):
+        bounded.set_title("SCAN OUT WUZUS")
+        content_cols, content_rows = bounded.content_size()
+        start_row = (content_rows - 6) // 2 + 1
+        bounded.print_centered(start_row, "SCANNING OUT WUZUS")
+        bounded.print_centered(start_row + 2, "Scan wuzu tags to release them...")
+        wuzu_label = "Wuzu" if len(self.scan_out_found) == 1 else "Wuzus"
+        bounded.print_centered(start_row + 4, f"Scanned Out: {len(self.scan_out_found)} {wuzu_label}")
+        if self.scan_out_invalid > 0:
+            bounded.print_centered(start_row + 5, f"Invalid: {self.scan_out_invalid}")
 
     def _render_hunter_history(self, bounded):
         hunter_name = self.history_hunter.get('name', '?') if self.history_hunter else '?'
@@ -2190,7 +2358,7 @@ class AdminScreen(Screen):
         if self.state == self.STATE_PASSWORD:
             bounded.print_content(1, "[Enter] Submit  [X] Cancel")
         elif self.state == self.STATE_MENU:
-            bounded.print_content(1, "[W] Add Wuzu  [E] Edit Wuzu  [A] Add Admin  [Q] Quit  [X] Exit")
+            bounded.print_content(1, "[W] Wuzu [E] Edit [A] Admin [O] Override [S] Scan Out [Q] Quit [X] Exit")
         elif self.state == self.STATE_HUNTER_HISTORY:
             bounded.print_content(1, "[J/K] Navigate  [D] Delete Selected  [M] Manual Adjust  [X] Back")
         elif self.state == self.STATE_DELETE_CONFIRM:
@@ -2209,6 +2377,11 @@ class AdminScreen(Screen):
             bounded.print_content(1, "[Enter] Save  [X] Cancel")
         elif self.state == self.STATE_DELETE_WUZU_CONFIRM:
             bounded.print_content(1, "[Y] Confirm Delete  [N] Cancel")
+        elif self.state == self.STATE_OVERRIDE_SCAN_BADGE:
+            bounded.print_content(1, "Scan hunter badge...  [X] Cancel")
+        elif self.state == self.STATE_SCAN_OUT:
+            left = max(0, int(self.app.config.get('timing', {}).get('scan_timeout', 5) - (time.time() - self.scan_out_last_time)))
+            bounded.print_content(1, f"Scanning out wuzus...  Time remaining: {left}s  [X] Exit")
 
 
 # =============================================================================
@@ -2329,11 +2502,13 @@ class AddWuzuScreen(Screen):
 # SCAN WUZU SCREEN
 # =============================================================================
 class ScanWuzuScreen(Screen):
-    def __init__(self, app, hunter_uid):
+    def __init__(self, app, hunter_uid, override=False):
         super().__init__(app)
         self.hunter_uid = hunter_uid
+        self.override = override
         self.found = set()
         self.unknown = set()
+        self.rejected = {}  # {epc: reason_string}
         self.session_points = 0
         self.rank_before = app.db.get_hunter_rank(hunter_uid)
         self.last_time = time.time()
@@ -2358,52 +2533,97 @@ class ScanWuzuScreen(Screen):
         tags = self.app.uhf.inventory()
         for tag in tags:
             epc = tag["epc"]
-            if epc not in self.found and epc not in self.unknown:
-                self.last_time = time.time()
+            if epc in self.found or epc in self.unknown or epc in self.rejected:
+                continue
 
-                hunter = self.app.db.get_hunter(self.hunter_uid)
-                if hunter:
-                    points = self.app.db.get_wuzu_points(epc)
-                    if points > 0:
+            self.last_time = time.time()
+
+            hunter = self.app.db.get_hunter(self.hunter_uid)
+            if not hunter:
+                continue
+
+            if self.override:
+                # Override mode: skip all validation, score everything
+                points = self.app.db.get_wuzu_points(epc)
+                if points == 0:
+                    # Unregistered wuzu: use default points, do NOT register
+                    points = self.app.config.get('scoring', {}).get('default_points', 10)
+                self.found.add(epc)
+                self.session_points += points
+                self.app.record_wuzu_scan(self.hunter_uid, epc, points, override=True)
+            else:
+                points = self.app.db.get_wuzu_points(epc)
+                if points > 0:
+                    # Validate scan against cooldown/scan-out rules
+                    scoring_config = self.app.config.get('scoring', {})
+                    valid, reason = self.app.db.check_wuzu_scan_validity(epc, scoring_config)
+                    if valid:
                         self.found.add(epc)
                         self.session_points += points
                         self.app.record_wuzu_scan(self.hunter_uid, epc, points)
                     else:
-                        self.unknown.add(epc)
+                        self.rejected[epc] = reason
+                        wuzu = self.app.db.get_wuzu(epc)
+                        wuzu_name = wuzu.get('name') or epc if wuzu else epc
+                        self.app.log_event("REJECTED", hunter_uid=self.hunter_uid,
+                            wuzu_epc=epc,
+                            details=f"{hunter['name']} rejected {wuzu_name}: {reason}",
+                            private=True)
+                else:
+                    self.unknown.add(epc)
+                    if self.app.db.wuzu_exists(epc):
+                        self.app.log_event("REJECTED", hunter_uid=self.hunter_uid,
+                            wuzu_epc=epc,
+                            details=f"{hunter['name']} scanned deleted wuzu {epc}",
+                            private=True)
+                    else:
+                        self.app.log_event("REJECTED", hunter_uid=self.hunter_uid,
+                            details=f"{hunter['name']} scanned unregistered tag {epc}",
+                            private=True)
 
-                    self.app.beep("new_wuzu")
-                    self.app.tui.mark_dirty(PANEL_MAIN)
-                    self.app.tui.mark_dirty(PANEL_FOOTER)
-        
+            self.app.beep("new_wuzu")
+            self.app.tui.mark_dirty(PANEL_MAIN)
+            self.app.tui.mark_dirty(PANEL_FOOTER)
+
         # Mark footer dirty every loop to update countdown timer
         self.app.tui.mark_dirty(PANEL_FOOTER)
 
         if time.time() - self.last_time > self.timeout:
             self.app.beep("complete")
-            self.app.switch_screen(ResultsScreen(self.app, self.hunter_uid, self.found, self.session_points, self.rank_before, len(self.unknown)))
+            self.app.switch_screen(ResultsScreen(self.app, self.hunter_uid, self.found,
+                self.session_points, self.rank_before, len(self.unknown),
+                self.rejected, self.override))
 
     def render_main(self, bounded, app_state):
         """Show scanning progress"""
         bounded.set_title("SCANNING WUZUS")
-        
+
         hunter = self.app.db.get_hunter(self.hunter_uid)
         name = hunter['name'] if hunter else "Unknown"
-        
+
         content_cols, content_rows = bounded.content_size()
-        start_row = (content_rows - 6) // 2 + 1
-        
+        start_row = (content_rows - 8) // 2 + 1
+
+        if self.override:
+            bounded.print_centered(start_row, "*** ADMIN OVERRIDE MODE ***")
         bounded.print_centered(start_row + 1, f"Hunter: {name}")
         bounded.print_centered(start_row + 3, "SCANNING FOR WUZUS...")
         wuzu_label = "Wuzu" if len(self.found) == 1 else "Wuzus"
         bounded.print_centered(start_row + 5, f"Found: {len(self.found)} {wuzu_label}")
+        row = 7
         if self.unknown:
             entity_label = "Unknown Entity Detected" if len(self.unknown) == 1 else "Unknown Entities Detected"
-            bounded.print_centered(start_row + 7, f"{len(self.unknown)} {entity_label}")
+            bounded.print_centered(start_row + row, f"{len(self.unknown)} {entity_label}")
+            row += 1
+        if self.rejected:
+            rejected_label = "Wuzu Rejected" if len(self.rejected) == 1 else "Wuzus Rejected"
+            bounded.print_centered(start_row + row, f"{len(self.rejected)} {rejected_label}")
 
     def render_footer(self, bounded, app_state):
         left = max(0, int(self.timeout - (time.time() - self.last_time)))
-        
-        bounded.set_title("SCORING MODE")
+
+        title = "OVERRIDE MODE" if self.override else "SCORING MODE"
+        bounded.set_title(title)
         bounded.print_content(1, "Scan Wuzus to score points!")
         bounded.print_content(2, f"Time remaining: {left}s  [X] Exit")
 
@@ -2412,13 +2632,16 @@ class ScanWuzuScreen(Screen):
 # RESULTS SCREEN
 # =============================================================================
 class ResultsScreen(Screen):
-    def __init__(self, app, hunter_uid, wuzus, session_points=0, rank_before=None, unknown_count=0):
+    def __init__(self, app, hunter_uid, wuzus, session_points=0, rank_before=None,
+                 unknown_count=0, rejected=None, override=False):
         super().__init__(app)
         self.hunter_uid = hunter_uid
         self.wuzus = list(wuzus)
         self.session_points = session_points
         self.rank_before = rank_before
         self.unknown_count = unknown_count
+        self.rejected = rejected or {}
+        self.override = override
         self.timeout = app.config.get('timing', {}).get('results_display', 10)
         self.start_time = time.time()  # Track when we started
 
@@ -2452,24 +2675,39 @@ class ResultsScreen(Screen):
         current_rank = self.app.db.get_hunter_rank(self.hunter_uid)
 
         content_cols, content_rows = bounded.content_size()
-        start_row = (content_rows - 12) // 2 + 1
+        start_row = (content_rows - 14) // 2 + 1
 
-        bounded.print_centered(start_row, "SCAN COMPLETE!")
+        if self.override:
+            bounded.print_centered(start_row, "OVERRIDE SCAN COMPLETE!")
+        else:
+            bounded.print_centered(start_row, "SCAN COMPLETE!")
         bounded.print_centered(start_row + 2, f"Hunter: {name}")
         bounded.print_centered(start_row + 4, "--- THIS SESSION ---")
         bounded.print_centered(start_row + 5, f"Wuzus Found: {len(self.wuzus)}    Points Earned: {self.session_points}")
+        row = 6
         if self.unknown_count > 0:
             entity_label = "Unknown Entity Detected" if self.unknown_count == 1 else "Unknown Entities Detected"
-            bounded.print_centered(start_row + 6, f"{self.unknown_count} {entity_label}")
-        bounded.print_centered(start_row + 7, "--- ALL TIME ---")
-        bounded.print_centered(start_row + 8, f"Unique Wuzus: {total_unique}    Total Scans: {total_scans}    Total Points: {total_points}")
+            bounded.print_centered(start_row + row, f"{self.unknown_count} {entity_label}")
+            row += 1
+        if self.rejected:
+            rejected_label = "Wuzu Rejected" if len(self.rejected) == 1 else "Wuzus Rejected"
+            bounded.print_centered(start_row + row, f"{len(self.rejected)} {rejected_label}")
+            row += 1
+            # Show deduplicated reasons
+            unique_reasons = set(self.rejected.values())
+            for reason in list(unique_reasons)[:2]:
+                count = sum(1 for r in self.rejected.values() if r == reason)
+                bounded.print_centered(start_row + row, f"  ({count}x) {reason}")
+                row += 1
+        bounded.print_centered(start_row + row, "--- ALL TIME ---")
+        bounded.print_centered(start_row + row + 1, f"Unique Wuzus: {total_unique}    Total Scans: {total_scans}    Total Points: {total_points}")
 
         rank_text = f"Rank: #{current_rank}" if current_rank else "Rank: --"
         if self.rank_before and current_rank and current_rank < self.rank_before:
             rank_text += f" (up from #{self.rank_before}!)"
         elif self.rank_before and current_rank and current_rank > self.rank_before:
             rank_text += f" (down from #{self.rank_before})"
-        bounded.print_centered(start_row + 10, rank_text)
+        bounded.print_centered(start_row + row + 3, rank_text)
 
     def render_footer(self, bounded, app_state):
         # Calculate remaining time for display
@@ -2576,16 +2814,25 @@ class WuzuApp:
         self.db.log_event(event_type, hunter_uid, wuzu_epc, details, points, private)
         self.tui.mark_dirty(PANEL_SECONDARY)
     
-    def record_wuzu_scan(self, hunter_uid, wuzu_epc, points=10):
+    def record_wuzu_scan(self, hunter_uid, wuzu_epc, points=10, override=False):
         """Record a wuzu scan and update scores"""
         hunter = self.db.get_hunter(hunter_uid)
         if hunter:
             self.db.update_hunter_score(hunter_uid, points)
-            self.db.increment_wuzu_found(wuzu_epc)
+
             wuzu = self.db.get_wuzu(wuzu_epc)
-            wuzu_name = wuzu['name'] if wuzu and wuzu.get('name') else "a Wuzu"
-            self.log_event("SCORE", hunter_uid, wuzu_epc,
-                          f"{hunter['name']} caught {wuzu_name} (+{points}pts)",
+            if wuzu:
+                self.db.increment_wuzu_found(wuzu_epc)
+                wuzu_name = wuzu.get('name') or "a Wuzu"
+            else:
+                wuzu_name = f"Unregistered ({wuzu_epc[:12]}...)"
+
+            event_type = "OVERRIDE_SCORE" if override else "SCORE"
+            prefix = "[OVERRIDE] " if override else ""
+            # Use None for wuzu_epc if unregistered (FK constraint would reject unknown EPCs)
+            epc_for_event = wuzu_epc if wuzu else None
+            self.log_event(event_type, hunter_uid, epc_for_event,
+                          f"{prefix}{hunter['name']} caught {wuzu_name} (+{points}pts)",
                           points)
 
     def run(self):
@@ -2672,6 +2919,12 @@ def get_default_config():
                 'hunter_id': [0, 0, 0],
                 'complete': [0, 0, 0],
             }
+        },
+        'scoring': {
+            'default_points': 10,
+            'cooldown_minutes': 1,
+            'scan_out': False,
+            'cooldown_overrides_scan_out': False,
         },
         'display': {
             'border_char': '─',

@@ -8,7 +8,7 @@
 host = "localhost"
 port = 5432
 database = "wuzu"
-user = "postgres"
+user = "wuzu"
 password = "your_password"
 
 [hardware]
@@ -63,6 +63,22 @@ complete = [0, 0, 0]        # Triple beep pattern when scan complete
 [scoring]
 # Default points value assigned to new wuzus
 default_points = 10
+
+# Three options give full flexibility:
+#  `scan_out=true`, `cooldown_overrides_scan_out=false`: Must have valid scan-out to score. Cooldown irrelevant. (Scenario I)
+#  `scan_out=false`, `cooldown>0`: Cooldown applies, valid scan-out overrides it. (Scenario II)
+#  `scan_out=true`, `cooldown_overrides_scan_out=true`, `cooldown>0`: Scan-out required, but expired cooldown can substitute. (Hybrid)
+#  `scan_out=false`, `cooldown=0`: Everything scores freely. (Scenario III)
+
+# Minutes before same wuzu can be re-scored (0 = disabled)
+cooldown_minutes = 1
+
+# Enable scan-out tracking (wuzu must be scanned out before re-scoring)
+scan_out = false
+
+# Allow expired cooldown to substitute for missing scan-out
+# Only applies when scan_out = true
+cooldown_overrides_scan_out = false
 
 [display]
 # Character used for borders

@@ -1,4 +1,4 @@
-# Wuzu Scanner - Cyberpunk RFID Hunt Game
+# Wuzu Scanner
 
 A terminal-based RFID hunting game using NFC badges for player identification and UHF RFID tags for collectible "wuzus".
 

@@ -446,6 +446,25 @@ def find_config():
     return os.path.join(script_dir, "config.toml")
 
 
+def ensure_config_exists(path):
+    """If config.toml doesn't exist, offer to create it from example-config.toml."""
+    if os.path.exists(path):
+        return True
+    example = os.path.join(os.path.dirname(path), "example-config.toml")
+    if not os.path.exists(example):
+        print(f"  Neither config.toml nor example-config.toml found.")
+        return False
+    print(f"  config.toml not found.")
+    answer = input(f"  Create from example-config.toml? [Y/n]: ").strip().lower()
+    if answer == "n":
+        return False
+    import shutil
+    shutil.copy2(example, path)
+    print(f"  Created {path}")
+    print(f"  NOTE: Edit config.toml to set your database credentials.")
+    return True
+
+
 def read_current_config(path):
     """Read current hardware values from config.toml."""
     values = {'uhf_port': None, 'uhf_baudrate': None, 'uhf_type': None}
@@ -599,6 +618,10 @@ def main():
         return
 
     config_path = find_config()
+    if not ensure_config_exists(config_path):
+        print("  Skipping config update.")
+        return
+
     current = read_current_config(config_path)
 
     print()

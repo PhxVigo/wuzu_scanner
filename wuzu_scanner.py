@@ -3285,12 +3285,16 @@ class WuzuApp:
         time.sleep(2)
         self.terminal.clear()
 
-        # On Linux/RPi, disable terminal echo so keystrokes don't appear at
-        # the cursor position (which is the bottom status bar row).
+        # On Linux/RPi, disable terminal echo and canonical mode so keystrokes
+        # don't appear at the cursor position (the bottom status bar row).
+        # Also disable ICRNL so Enter delivers \r consistently (not \n).
         old_tty_settings = None
         if platform.system() != "Windows":
             old_tty_settings = termios.tcgetattr(sys.stdin)
             tty.setcbreak(sys.stdin)
+            mode = termios.tcgetattr(sys.stdin)
+            mode[0] &= ~termios.ICRNL  # Don't translate CR to NL
+            termios.tcsetattr(sys.stdin, termios.TCSANOW, mode)
         print("\033[?25l", end="", flush=True)  # Hide cursor
 
         try:

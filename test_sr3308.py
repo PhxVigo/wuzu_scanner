@@ -331,6 +331,7 @@ class HidTransport:
         self.dev = hidapi.device()
         self.dev.open_path(self.device_path)
         self.dev.set_nonblocking(True)
+        time.sleep(0.1)  # settle time after open before first write
 
     def close(self):
         if self.dev:
@@ -535,6 +536,7 @@ def detect_hid(log):
             dev = hidapi.device()
             dev.open_path(path)
             dev.set_nonblocking(True)
+            time.sleep(0.1)  # settle time after open before first write
         except Exception as e:
             log.detail(f"    could not open: {e}")
             continue

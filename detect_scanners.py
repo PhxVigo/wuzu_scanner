@@ -270,6 +270,7 @@ def detect_uhf_hid():
             dev = hidapi.device()
             dev.open_path(path)
             dev.set_nonblocking(True)
+            time.sleep(0.1)  # settle time after open
         except Exception as e:
             print(f"--> could not open: {e}")
             continue

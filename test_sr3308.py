@@ -7,15 +7,14 @@ Standalone diagnostic tool that exercises every SR3308 function wuzu-scanner
 will need, with verbose step-by-step hex tracing.
 
 Run this on a machine with the SR3308 plugged in via USB. The reader
-defaults to USB-HID mode, so this script tries HID first, switches the
-reader to serial + command-polled mode, then reconnects over serial and
-runs the remaining tests.
+defaults to USB-HID mode, so this script tries HID first (probing
+multiple framing strategies), then falls back to serial. All tests
+run over whichever transport was detected.
 
     1. Auto-detect the SR3308 (HID first, then serial fallback)
     2. Read device info
     3. Read base parameters (current output/work mode)
-    4. Switch the reader into serial + command-polled mode
-       (auto-reconnects over serial after the switch)
+    4. Ensure command-polled work mode
     5. Verify the mode change
     6. Read current TX power
     7. Set TX power to 20 dBm
@@ -751,8 +750,10 @@ def step_get_params(r, log, step_num=3):
     return (outputmode, workmode)
 
 
-def step_set_serial_mode(r, log):
-    log.step(4, TOTAL_STEPS, "Switching reader to serial + command-polled mode (RCP_CMD_PARA, SET)")
+def step_set_command_mode(r, log):
+    log.step(4, TOTAL_STEPS, "Setting command-polled work mode (RCP_CMD_PARA, SET)")
+    # Set workmode=0x01 (command-polled). Keep whatever output mode is current
+    # since USB HID devices stay HID regardless of the outputmode setting.
     frames = r.send_and_receive(CMD_PARA, MSG_SET, payload=bytes([0x01, 0x01]),
                                 expect_frames=1, read_timeout=0.8)
     if not frames:
@@ -970,38 +971,8 @@ def main():
         # Step 3: read current params
         results["params_before"] = _safe(log, "PARA GET", step_get_params, r, log, step_num=3)
 
-        # Step 4: switch to serial + command mode
-        if connected_via_hid:
-            log.info("")
-            log.info("    Reader is connected via HID — will switch to serial mode")
-            log.info("    and reconnect over serial for remaining tests.")
-            mode_ok = _safe(log, "PARA SET", step_set_serial_mode, r, log)
-            results["set_serial_mode"] = mode_ok
-
-            if mode_ok:
-                # Close HID, wait for serial re-enumeration, reconnect
-                log.info("")
-                log.info("    Closing HID connection...")
-                r.close()
-                time.sleep(2)  # give the device a moment to re-enumerate
-
-                serial_transport = wait_for_serial_reconnect(log, max_wait=10)
-                if serial_transport:
-                    transport = serial_transport
-                    r = Sr3308(transport, log)
-                    connected_via_hid = False
-                    log.ok(f"Reconnected via {transport.description}")
-                else:
-                    log.fail("Could not reconnect over serial after mode switch.")
-                    log.info("    The mode change may still have worked. Try rerunning:")
-                    log.info("    python test_sr3308.py")
-                    log.close()
-                    sys.exit(4)
-            else:
-                log.warn("Mode switch failed or was rejected — continuing tests over HID")
-        else:
-            # Already on serial — still send the mode set to ensure correct config
-            results["set_serial_mode"] = _safe(log, "PARA SET", step_set_serial_mode, r, log)
+        # Step 4: ensure command-polled mode
+        results["set_command_mode"] = _safe(log, "PARA SET", step_set_command_mode, r, log)
 
         # Step 5: verify params
         results["params_after"] = _safe(log, "PARA GET (verify)", step_get_params, r, log, step_num=5)
@@ -1022,7 +993,7 @@ def main():
     log.info(f"  Transport:           {results.get('transport')}")
     log.info(f"  Device info:         {results.get('info')}")
     log.info(f"  Params before:       {results.get('params_before')}")
-    log.info(f"  Set serial+cmd mode: {results.get('set_serial_mode')}")
+    log.info(f"  Set command mode:    {results.get('set_command_mode')}")
     log.info(f"  Params after:        {results.get('params_after')}")
     log.info(f"  TX power before:     {results.get('tx_power_before')}")
     log.info(f"  Set TX power:        {results.get('set_power')}")

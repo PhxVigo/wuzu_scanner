@@ -307,10 +307,12 @@ class HidTransport:
     """Wraps hidapi for RCP communication over USB HID."""
     name = "hid"
 
-    def __init__(self, device_path, vid=0, pid=0):
+    def __init__(self, device_path, vid=0, pid=0, report_id=0x00, report_size=64):
         self.device_path = device_path
         self.vid = vid
         self.pid = pid
+        self.report_id = report_id
+        self.report_size = report_size
         self.dev = None
 
     def open(self):
@@ -326,35 +328,31 @@ class HidTransport:
                 pass
             self.dev = None
 
-    def send(self, data):
-        """Send RCP frame wrapped in an HID report.
+    def send_raw(self, report):
+        """Send a raw HID report (for probing different framings)."""
+        self.dev.write(bytes(report))
 
-        HID reports: prepend 0x00 report ID, then the RCP frame bytes,
-        pad with 0x00 to HID_REPORT_SIZE.
-        """
-        report = bytearray(HID_REPORT_SIZE)
-        report[0] = 0x00  # report ID
+    def send(self, data):
+        """Send RCP frame wrapped in an HID report using current framing."""
+        report = bytearray(self.report_size + 1)  # +1 for report ID
+        report[0] = self.report_id
         report[1:1+len(data)] = data
         self.dev.write(bytes(report))
 
     def receive(self, timeout=0.8):
-        """Read HID reports until timeout, strip padding, return raw bytes."""
+        """Read HID reports until timeout, return raw bytes."""
         buf = bytearray()
         deadline = time.time() + timeout
         while time.time() < deadline:
-            report = self.dev.read(HID_REPORT_SIZE)
+            report = self.dev.read(max(self.report_size, 64))
             if report:
-                # Strip trailing zero padding — RCP frames are shorter than
-                # the full report. We keep everything up to the last non-zero
-                # byte (or all of it if the frame legitimately contains zeros
-                # in the payload). The frame parser will handle validation.
                 buf.extend(bytes(report))
                 # Check if we have a plausible complete frame already
                 if PREAMBLE_RX in buf:
                     # give a short grace for any follow-up reports
                     grace = time.time() + 0.15
                     while time.time() < grace:
-                        more = self.dev.read(HID_REPORT_SIZE)
+                        more = self.dev.read(max(self.report_size, 64))
                         if more:
                             buf.extend(bytes(more))
                     break
@@ -492,53 +490,133 @@ def detect_hid(log):
         log.info(f"    VID={vid:04X} PID={pid:04X} mfg={mfg!r} prod={prod!r}")
         log.detail(f"    path={path}")
 
-    # Try each HID device — send INFO GET and look for a valid RCP response
-    for d in devices:
+    # Known VID/PID for the SR3308 — try these interfaces first
+    SR3308_VID = 0x04D8
+    SR3308_PID = 0x033F
+
+    # Sort: known SR3308 VID/PID first, skip known non-matches (keyboards, mice)
+    SKIP_VIDS = {0x046D}  # Logitech
+    candidates = sorted(devices, key=lambda d: (
+        0 if (d.get("vendor_id") == SR3308_VID and d.get("product_id") == SR3308_PID) else 1
+    ))
+    candidates = [d for d in candidates if d.get("vendor_id") not in SKIP_VIDS]
+
+    # Try multiple HID framing strategies for each device.
+    # Different devices expect different report formats:
+    #   Strategy A: report_id=0x00, 64-byte padded report (common for custom HID)
+    #   Strategy B: raw frame only, no report ID, no padding (some simple devices)
+    #   Strategy C: report_id=0x00, 8-byte report (keyboard-size reports)
+    #   Strategy D: report_id=0x00, frame bytes + length prefix
+    FRAMING_STRATEGIES = [
+        ("64B padded, report_id=0x00",  lambda data: bytes([0x00]) + data + bytes(64 - len(data))),
+        ("raw frame, no report_id",     lambda data: data),
+        ("raw frame + zero pad to 8",   lambda data: data + bytes(max(0, 8 - len(data)))),
+        ("raw frame + zero pad to 64",  lambda data: data + bytes(max(0, 64 - len(data)))),
+        ("length-prefixed",             lambda data: bytes([0x00, len(data)]) + data + bytes(max(0, 62 - len(data)))),
+    ]
+
+    info_frame = build_frame(CMD_INFO, MSG_GET)
+
+    for d in candidates:
         vid = d.get("vendor_id", 0)
         pid = d.get("product_id", 0)
         path = d.get("path", b"")
         mfg = d.get("manufacturer_string", "") or ""
         prod = d.get("product_string", "") or ""
+        usage_page = d.get("usage_page", 0)
+        usage = d.get("usage", 0)
+        interface = d.get("interface_number", -1)
 
-        log.info(f"  Probing VID={vid:04X} PID={pid:04X} ({mfg} {prod})...")
+        log.info(f"  Probing VID={vid:04X} PID={pid:04X} iface={interface} "
+                 f"usage_page=0x{usage_page:04X} usage=0x{usage:04X} ({mfg} {prod})...")
 
-        transport = HidTransport(path, vid, pid)
-        try:
-            transport.open()
-        except Exception as e:
-            log.detail(f"    could not open: {e}")
-            continue
+        for strategy_name, build_report in FRAMING_STRATEGIES:
+            log.detail(f"    Trying framing: {strategy_name}")
 
-        # Send INFO GET and see if we get a valid RCP frame back
-        info_frame = build_frame(CMD_INFO, MSG_GET)
-        log.hex_line("TX", info_frame)
-        try:
-            transport.send(info_frame)
-            raw = transport.receive(timeout=1.0)
-        except Exception as e:
-            log.detail(f"    send/receive error: {e}")
-            transport.close()
-            continue
+            try:
+                dev = hidapi.device()
+                dev.open_path(path)
+                dev.set_nonblocking(True)
+            except Exception as e:
+                log.detail(f"      could not open: {e}")
+                break  # no point trying other strategies if we can't open
 
-        if raw:
-            log.hex_line("RX", bytes(raw))
-        else:
-            log.detail("    no response")
-            transport.close()
-            continue
+            report = build_report(info_frame)
+            log.hex_line("TX", report)
+            try:
+                dev.write(report)
+            except Exception as e:
+                log.detail(f"      write error: {e}")
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+                continue
 
-        # Try to parse RCP frames from the response
-        rx_buf = bytearray(raw)
-        frames = extract_frames(rx_buf, log)
-        for f in frames:
-            if f["code"] == CMD_INFO and f["type_masked"] in (RSP_DATA, RSP_OK) and f["len"] >= 1:
-                info_text = bytes(f["payload"]).decode("ascii", errors="replace").strip()
-                log.ok(f"SR3308 found via HID! VID={vid:04X} PID={pid:04X}")
-                log.ok(f"Device info: {info_text!r}")
-                return transport
+            # Read response
+            buf = bytearray()
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                try:
+                    data = dev.read(64)
+                except Exception:
+                    break
+                if data:
+                    buf.extend(bytes(data))
+                    if PREAMBLE_RX in buf:
+                        # grace period for additional data
+                        grace = time.time() + 0.2
+                        while time.time() < grace:
+                            try:
+                                more = dev.read(64)
+                            except Exception:
+                                break
+                            if more:
+                                buf.extend(bytes(more))
+                        break
+                else:
+                    time.sleep(0.01)
 
-        log.detail("    valid HID device but not an SR3308 (no INFO response)")
-        transport.close()
+            if buf:
+                log.hex_line("RX", bytes(buf))
+                rx_tmp = bytearray(buf)
+                frames = extract_frames(rx_tmp, log)
+                for f in frames:
+                    if f["code"] == CMD_INFO and f["type_masked"] in (RSP_DATA, RSP_OK) and f["len"] >= 1:
+                        info_text = bytes(f["payload"]).decode("ascii", errors="replace").strip()
+                        log.ok(f"SR3308 found via HID! VID={vid:04X} PID={pid:04X} iface={interface}")
+                        log.ok(f"Framing: {strategy_name}")
+                        log.ok(f"Device info: {info_text!r}")
+                        # Build a properly configured transport
+                        # Figure out report_id and size from the winning strategy
+                        try:
+                            dev.close()
+                        except Exception:
+                            pass
+                        transport = HidTransport(path, vid, pid)
+                        # Configure based on which strategy worked
+                        if "no report_id" in strategy_name:
+                            transport.report_id = None  # signal to skip report ID
+                        transport.open()
+                        # Monkey-patch send to use the winning strategy
+                        winning_build = build_report
+                        def make_send(build_fn, device):
+                            def custom_send(data):
+                                device.dev.write(build_fn(data))
+                            return custom_send
+                        transport.send = make_send(winning_build, transport)
+                        return transport
+                if frames:
+                    log.detail(f"      got frames but not INFO response")
+                else:
+                    log.detail(f"      got bytes but no valid RCP frames")
+            else:
+                log.detail(f"      no response")
+
+            try:
+                dev.close()
+            except Exception:
+                pass
 
     log.info("  No SR3308 found via HID")
     return None

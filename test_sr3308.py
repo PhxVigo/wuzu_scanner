@@ -733,10 +733,9 @@ def step_get_params(r, log, step_num=3):
     return (outputmode, workmode)
 
 
-def step_set_command_mode(r, log):
-    log.step(4, TOTAL_STEPS, "Setting command-polled work mode (RCP_CMD_PARA, SET)")
-    # Set workmode=0x01 (command-polled). Keep whatever output mode is current
-    # since USB HID devices stay HID regardless of the outputmode setting.
+def step_set_serial_command_mode(r, log):
+    log.step(4, TOTAL_STEPS, "Setting serial + command-polled mode (RCP_CMD_PARA, SET)")
+    # outputmode=0x01 (serial), workmode=0x01 (command-polled)
     frames = r.send_and_receive(CMD_PARA, MSG_SET, payload=bytes([0x01, 0x01]),
                                 expect_frames=1, read_timeout=0.8)
     if not frames:
@@ -754,6 +753,21 @@ def step_set_command_mode(r, log):
         return False
     log.warn(f"unexpected response type 0x{f['type']:02X}")
     return False
+
+
+def step_reset_device(r, log):
+    """Send CMD_RESET to force the reader to re-enumerate on USB."""
+    log.info("    Sending device reset (CMD_RESET) to force USB re-enumeration...")
+    try:
+        # The device may not respond before resetting, so don't fail on no-response
+        frames = r.send_and_receive(CMD_RESET, MSG_CMD, expect_frames=1, read_timeout=1.0)
+        if frames and frames[-1]["type_masked"] == RSP_OK:
+            log.ok("device acknowledged reset")
+        else:
+            log.detail("    no ACK (device may have reset immediately)")
+    except Exception:
+        log.detail("    connection lost (expected — device is resetting)")
+    return True
 
 
 def step_get_power(r, log):
@@ -954,11 +968,37 @@ def main():
         # Step 3: read current params
         results["params_before"] = _safe(log, "PARA GET", step_get_params, r, log, step_num=3)
 
-        # Step 4: ensure command-polled mode
-        results["set_command_mode"] = _safe(log, "PARA SET", step_set_command_mode, r, log)
+        # Step 4: set serial + command-polled mode
+        results["set_serial_mode"] = _safe(log, "PARA SET", step_set_serial_command_mode, r, log)
 
-        # Step 5: verify params
-        results["params_after"] = _safe(log, "PARA GET (verify)", step_get_params, r, log, step_num=5)
+        # If we're on HID, reset the device so it re-enumerates as serial
+        if connected_via_hid and results.get("set_serial_mode"):
+            step_reset_device(r, log)
+            r.close()
+            time.sleep(3)  # give the device time to reset and re-enumerate
+
+            log.step(5, TOTAL_STEPS, "Reconnecting over serial after mode switch + reset")
+            serial_transport = wait_for_serial_reconnect(log, max_wait=15)
+            if serial_transport:
+                transport = serial_transport
+                r = Sr3308(transport, log)
+                connected_via_hid = False
+                results["transport"] = transport.description
+                log.ok(f"Reconnected via {transport.description}")
+            else:
+                log.fail("Could not reconnect over serial after reset.")
+                log.info("    The reader may need to be power-cycled.")
+                log.info("    Unplug USB, wait 5 seconds, replug, then rerun.")
+                log.close()
+                sys.exit(4)
+        else:
+            # Already on serial, or mode switch failed — verify params
+            log.step(5, TOTAL_STEPS, "Verifying parameters")
+            results["params_after"] = _safe(log, "PARA GET (verify)", step_get_params, r, log, step_num=5)
+
+        # Re-verify params after reconnect
+        if not connected_via_hid:
+            results["params_after"] = _safe(log, "PARA GET (verify)", step_get_params, r, log, step_num=5)
 
         # Steps 6-9: power, beep, inventory
         results["tx_power_before"] = _safe(log, "GET_TX_PWR", step_get_power, r, log)
@@ -976,7 +1016,7 @@ def main():
     log.info(f"  Transport:           {results.get('transport')}")
     log.info(f"  Device info:         {results.get('info')}")
     log.info(f"  Params before:       {results.get('params_before')}")
-    log.info(f"  Set command mode:    {results.get('set_command_mode')}")
+    log.info(f"  Set serial+cmd mode: {results.get('set_serial_mode')}")
     log.info(f"  Params after:        {results.get('params_after')}")
     log.info(f"  TX power before:     {results.get('tx_power_before')}")
     log.info(f"  Set TX power:        {results.get('set_power')}")

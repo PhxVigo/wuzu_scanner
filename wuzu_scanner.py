@@ -3284,6 +3284,15 @@ class WuzuApp:
         print("Starting application...")
         time.sleep(2)
         self.terminal.clear()
+
+        # On Linux/RPi, disable terminal echo so keystrokes don't appear at
+        # the cursor position (which is the bottom status bar row).
+        old_tty_settings = None
+        if platform.system() != "Windows":
+            old_tty_settings = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin)
+        print("\033[?25l", end="", flush=True)  # Hide cursor
+
         try:
             while True:
                 time.sleep(self.config.get('timing', {}).get('nfc_poll_interval', 0.05))
@@ -3294,30 +3303,34 @@ class WuzuApp:
                 self.screen.handle(key, uid)
 
                 now = time.time()
-                
+
                 # Update time display every second
                 if now - self.last_time_update >= 1:
                     self.tui.mark_dirty(PANEL_STATUS)
                     self.last_time_update = now
-                
+
                 # Refresh leaderboard data periodically
                 if now - self.last_data_refresh >= self.data_refresh_interval:
                     self.tui.mark_dirty(PANEL_MAIN)
                     self.last_data_refresh = now
-                
+
                 # Check database health periodically
                 if now - self.last_db_health_check >= self.db_health_check_interval:
                     db_status = self.db.test_connection()
                     if db_status['status'] != self.db_status:
                         old_status = self.db_status
                         self.db_status = db_status['status']
-                        print(f"[DB] Status changed: {old_status} -> {self.db_status}")
                         self.tui.mark_dirty(PANEL_STATUS)
                     self.last_db_health_check = now
 
                 self.tui.render(self.screen, self.terminal, self.data)
 
         except KeyboardInterrupt:
+            pass
+        finally:
+            print("\033[?25h", end="", flush=True)  # Show cursor
+            if old_tty_settings is not None:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty_settings)
             self.terminal.clear()
             self.db.close()
             print("Exiting...")

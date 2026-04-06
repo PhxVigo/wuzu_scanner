@@ -649,45 +649,6 @@ def detect_serial(log):
     return None
 
 
-def wait_for_serial_reconnect(log, max_wait=10):
-    """After switching from HID to serial mode, wait for the device to
-    re-enumerate as a serial port and return a SerialTransport.
-
-    Polls every second for up to max_wait seconds.
-    """
-    log.info(f"Waiting up to {max_wait}s for the reader to re-appear as a serial port...")
-
-    for elapsed in range(max_wait):
-        time.sleep(1)
-        log.detail(f"  ({elapsed+1}s) scanning ports...")
-        ports = list(serial.tools.list_ports.comports())
-        for p in ports:
-            # Skip well-known built-in ports that aren't USB
-            if p.device in ("/dev/ttyS0", "/dev/ttyAMA0"):
-                continue
-            log.detail(f"    trying {p.device} ({p.description})...")
-            transport = SerialTransport(p.device)
-            try:
-                transport.open()
-            except Exception:
-                continue
-            reader = Sr3308(transport, log)
-            try:
-                frames = reader.send_and_receive(CMD_INFO, MSG_GET,
-                                                 expect_frames=1, read_timeout=0.6)
-            except Exception:
-                transport.close()
-                continue
-            for f in frames:
-                if f["code"] == CMD_INFO and f["type_masked"] in (RSP_DATA, RSP_OK) and f["len"] >= 1:
-                    log.ok(f"SR3308 reconnected on {p.device}")
-                    return transport
-            transport.close()
-
-    log.fail("SR3308 did not appear on any serial port after mode switch")
-    return None
-
-
 # ----------------------------------------------------------------------------
 # Test steps
 # ----------------------------------------------------------------------------
@@ -733,9 +694,10 @@ def step_get_params(r, log, step_num=3):
     return (outputmode, workmode)
 
 
-def step_set_serial_command_mode(r, log):
-    log.step(4, TOTAL_STEPS, "Setting serial + command-polled mode (RCP_CMD_PARA, SET)")
-    # outputmode=0x01 (serial), workmode=0x01 (command-polled)
+def step_set_command_mode(r, log):
+    log.step(4, TOTAL_STEPS, "Setting command-polled work mode (RCP_CMD_PARA, SET)")
+    # Keep outputmode as-is (0x01=serial is fine — it doesn't affect USB HID)
+    # Set workmode=0x01 (command-polled) to stop auto-push / keyboard typing
     frames = r.send_and_receive(CMD_PARA, MSG_SET, payload=bytes([0x01, 0x01]),
                                 expect_frames=1, read_timeout=0.8)
     if not frames:
@@ -746,28 +708,13 @@ def step_set_serial_command_mode(r, log):
         log.fail(f"unexpected code 0x{f['code']:02X}")
         return False
     if f["type_masked"] == RSP_OK:
-        log.ok("reader accepted the mode change")
+        log.ok("reader accepted the mode change (command-polled, no auto-push)")
         return True
     if f["type_masked"] == RSP_ERR:
         log.fail("reader rejected the mode change (ERR response)")
         return False
     log.warn(f"unexpected response type 0x{f['type']:02X}")
     return False
-
-
-def step_reset_device(r, log):
-    """Send CMD_RESET to force the reader to re-enumerate on USB."""
-    log.info("    Sending device reset (CMD_RESET) to force USB re-enumeration...")
-    try:
-        # The device may not respond before resetting, so don't fail on no-response
-        frames = r.send_and_receive(CMD_RESET, MSG_CMD, expect_frames=1, read_timeout=1.0)
-        if frames and frames[-1]["type_masked"] == RSP_OK:
-            log.ok("device acknowledged reset")
-        else:
-            log.detail("    no ACK (device may have reset immediately)")
-    except Exception:
-        log.detail("    connection lost (expected — device is resetting)")
-    return True
 
 
 def step_get_power(r, log):
@@ -896,7 +843,6 @@ def main():
     log.step(1, TOTAL_STEPS, "Detecting SR3308")
 
     transport = None
-    connected_via_hid = False
 
     if port_override:
         # Explicit serial port
@@ -908,15 +854,11 @@ def main():
     elif force_hid:
         log.info("Forced HID-only detection (--hid)")
         transport = detect_hid(log)
-        if transport:
-            connected_via_hid = True
     else:
         # Default: try HID first, then fall back to serial
         log.info("Trying HID detection first (reader defaults to USB-HID mode)...")
         transport = detect_hid(log)
-        if transport:
-            connected_via_hid = True
-        else:
+        if not transport:
             log.info("")
             log.info("HID detection failed — falling back to serial port scan...")
             transport = detect_serial(log)
@@ -968,37 +910,11 @@ def main():
         # Step 3: read current params
         results["params_before"] = _safe(log, "PARA GET", step_get_params, r, log, step_num=3)
 
-        # Step 4: set serial + command-polled mode
-        results["set_serial_mode"] = _safe(log, "PARA SET", step_set_serial_command_mode, r, log)
+        # Step 4: set command-polled mode (stops auto-push / keyboard typing)
+        results["set_command_mode"] = _safe(log, "PARA SET", step_set_command_mode, r, log)
 
-        # If we're on HID, reset the device so it re-enumerates as serial
-        if connected_via_hid and results.get("set_serial_mode"):
-            step_reset_device(r, log)
-            r.close()
-            time.sleep(3)  # give the device time to reset and re-enumerate
-
-            log.step(5, TOTAL_STEPS, "Reconnecting over serial after mode switch + reset")
-            serial_transport = wait_for_serial_reconnect(log, max_wait=15)
-            if serial_transport:
-                transport = serial_transport
-                r = Sr3308(transport, log)
-                connected_via_hid = False
-                results["transport"] = transport.description
-                log.ok(f"Reconnected via {transport.description}")
-            else:
-                log.fail("Could not reconnect over serial after reset.")
-                log.info("    The reader may need to be power-cycled.")
-                log.info("    Unplug USB, wait 5 seconds, replug, then rerun.")
-                log.close()
-                sys.exit(4)
-        else:
-            # Already on serial, or mode switch failed — verify params
-            log.step(5, TOTAL_STEPS, "Verifying parameters")
-            results["params_after"] = _safe(log, "PARA GET (verify)", step_get_params, r, log, step_num=5)
-
-        # Re-verify params after reconnect
-        if not connected_via_hid:
-            results["params_after"] = _safe(log, "PARA GET (verify)", step_get_params, r, log, step_num=5)
+        # Step 5: verify params
+        results["params_after"] = _safe(log, "PARA GET (verify)", step_get_params, r, log, step_num=5)
 
         # Steps 6-9: power, beep, inventory
         results["tx_power_before"] = _safe(log, "GET_TX_PWR", step_get_power, r, log)
@@ -1016,7 +932,7 @@ def main():
     log.info(f"  Transport:           {results.get('transport')}")
     log.info(f"  Device info:         {results.get('info')}")
     log.info(f"  Params before:       {results.get('params_before')}")
-    log.info(f"  Set serial+cmd mode: {results.get('set_serial_mode')}")
+    log.info(f"  Set command mode:    {results.get('set_command_mode')}")
     log.info(f"  Params after:        {results.get('params_after')}")
     log.info(f"  TX power before:     {results.get('tx_power_before')}")
     log.info(f"  Set TX power:        {results.get('set_power')}")

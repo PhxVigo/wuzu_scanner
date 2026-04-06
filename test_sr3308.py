@@ -86,6 +86,7 @@ CMD_GET_TX_PWR = 0x50
 CMD_SET_TX_PWR = 0x51
 CMD_PARA = 0x81
 CMD_INFO = 0x82
+CMD_USB = 0xBD
 CMD_SOUND = 0xBC
 CMD_RESET = 0xD0
 
@@ -96,6 +97,7 @@ OPCODE_NAMES = {
     0x81: "PARA (base params)",
     0x82: "INFO (device info)",
     0xBC: "SOUND (beeper)",
+    0xBD: "USB (USB mode)",
     0xD0: "RESET",
 }
 MSGTYPE_NAMES = {
@@ -115,6 +117,11 @@ OUTPUTMODE_NAMES = {
 WORKMODE_NAMES = {
     0x00: "Auto-read (pushes tags)",
     0x01: "Command-read (host polls)",
+}
+USBMODE_NAMES = {
+    0x00: "HID+KBD (command + keyboard)",
+    0x01: "HID+KBD+CDC (command + keyboard + serial)",
+    0x02: "HID (command only, no keyboard)",
 }
 
 SERIAL_BAUD = 57600
@@ -652,7 +659,7 @@ def detect_serial(log):
 # ----------------------------------------------------------------------------
 # Test steps
 # ----------------------------------------------------------------------------
-TOTAL_STEPS = 9
+TOTAL_STEPS = 11
 
 
 def step_info(r, log):
@@ -717,8 +724,54 @@ def step_set_command_mode(r, log):
     return False
 
 
+def step_get_usb_mode(r, log, step_num=5):
+    log.step(step_num, TOTAL_STEPS, "Getting USB mode (RCP_CMD_USB, GET)")
+    frames = r.send_and_receive(CMD_USB, MSG_GET, expect_frames=1, read_timeout=0.8)
+    if not frames:
+        log.fail("no response (device may not support CMD_USB)")
+        return None
+    f = frames[-1]
+    if f["code"] != CMD_USB:
+        log.fail(f"unexpected code 0x{f['code']:02X}")
+        return None
+    if f["type_masked"] == RSP_ERR:
+        log.fail(f"CMD_USB not supported (ERR), payload={' '.join(f'{b:02X}' for b in f['payload'])}")
+        return None
+    if f["len"] < 1:
+        log.fail("empty payload")
+        return None
+    mode = f["payload"][0]
+    mode_name = USBMODE_NAMES.get(mode, f"unknown(0x{mode:02X})")
+    log.ok(f"USB mode = {mode} ({mode_name})")
+    return mode
+
+
+def step_set_usb_mode(r, log, target_mode=2):
+    mode_name = USBMODE_NAMES.get(target_mode, f"0x{target_mode:02X}")
+    log.step(6, TOTAL_STEPS, f"Setting USB mode to {target_mode} ({mode_name})")
+    log.info("    This disables the keyboard interface to prevent phantom typing.")
+    frames = r.send_and_receive(CMD_USB, MSG_SET, payload=bytes([target_mode]),
+                                expect_frames=1, read_timeout=0.8)
+    if not frames:
+        log.fail("no response")
+        return False
+    f = frames[-1]
+    if f["code"] != CMD_USB:
+        log.fail(f"unexpected code 0x{f['code']:02X}")
+        return False
+    if f["type_masked"] == RSP_OK:
+        log.ok(f"USB mode set to {target_mode} ({mode_name})")
+        log.info("    Device will re-enumerate. May need to reconnect.")
+        return True
+    if f["type_masked"] == RSP_ERR:
+        log.fail(f"reader rejected USB mode change (ERR), payload={' '.join(f'{b:02X}' for b in f['payload'])}")
+        return False
+    log.warn(f"unexpected response type 0x{f['type']:02X}")
+    return False
+
+
 def step_get_power(r, log):
-    log.step(6, TOTAL_STEPS, "Getting TX power (RCP_CMD_GET_TX_PWR, GET)")
+    log.step(7, TOTAL_STEPS, "Getting TX power (RCP_CMD_GET_TX_PWR, GET)")
     frames = r.send_and_receive(CMD_GET_TX_PWR, MSG_GET, expect_frames=1, read_timeout=0.8)
     if not frames:
         log.fail("no response")
@@ -736,7 +789,7 @@ def step_get_power(r, log):
 
 
 def step_set_power(r, log, dbm=20):
-    log.step(7, TOTAL_STEPS, f"Setting TX power to {dbm} dBm (RCP_CMD_SET_TX_PWR, SET)")
+    log.step(8, TOTAL_STEPS, f"Setting TX power to {dbm} dBm (RCP_CMD_SET_TX_PWR, SET)")
     frames = r.send_and_receive(CMD_SET_TX_PWR, MSG_SET, payload=bytes([dbm]),
                                 expect_frames=1, read_timeout=0.8)
     if not frames:
@@ -757,7 +810,7 @@ def step_set_power(r, log, dbm=20):
 
 
 def step_beep(r, log):
-    log.step(8, TOTAL_STEPS, "Testing beeper (RCP_CMD_SOUND, CMD) — 2 short beeps")
+    log.step(9, TOTAL_STEPS, "Testing beeper (RCP_CMD_SOUND, CMD) — 2 short beeps")
     log.info(">>> LISTEN FOR 2 SHORT BEEPS NOW <<<")
     frames = r.send_and_receive(CMD_SOUND, MSG_CMD, payload=bytes([0x02, 0x01, 0x02]),
                                 expect_frames=1, read_timeout=1.5)
@@ -781,7 +834,7 @@ def step_beep(r, log):
 
 
 def step_inventory(r, log):
-    log.step(9, TOTAL_STEPS, f"Inventory polls ({INVENTORY_POLLS} rounds @ {int(INVENTORY_INTERVAL*1000)} ms)")
+    log.step(10, TOTAL_STEPS, f"Inventory polls ({INVENTORY_POLLS} rounds @ {int(INVENTORY_INTERVAL*1000)} ms)")
     log.info(">>> Place an EPC Gen2 UHF tag on the reader, then press ENTER <<<")
     try:
         input()
@@ -902,7 +955,7 @@ def main():
 
     results = {"transport": transport.description}
 
-    # ---------------- Steps 2..9 ----------------
+    # ---------------- Steps 2..11 ----------------
     try:
         # Step 2: device info
         results["info"] = _safe(log, "INFO", step_info, r, log)
@@ -910,17 +963,63 @@ def main():
         # Step 3: read current params
         results["params_before"] = _safe(log, "PARA GET", step_get_params, r, log, step_num=3)
 
-        # Step 4: set command-polled mode (stops auto-push / keyboard typing)
+        # Step 4: set command-polled mode
         results["set_command_mode"] = _safe(log, "PARA SET", step_set_command_mode, r, log)
 
-        # Step 5: verify params
-        results["params_after"] = _safe(log, "PARA GET (verify)", step_get_params, r, log, step_num=5)
+        # Step 5: read current USB mode
+        usb_mode = _safe(log, "USB GET", step_get_usb_mode, r, log, step_num=5)
+        results["usb_mode_before"] = usb_mode
 
-        # Steps 6-9: power, beep, inventory
+        # Step 6: set USB mode to HID-only (disable keyboard) if needed
+        if usb_mode is not None and usb_mode != 2:
+            results["set_usb_mode"] = _safe(log, "USB SET", step_set_usb_mode, r, log, target_mode=2)
+            if results.get("set_usb_mode"):
+                # Device will re-enumerate — close, wait, reconnect
+                log.info("")
+                log.info("    Device is re-enumerating after USB mode change...")
+                log.info("    Closing connection and waiting for device to reappear...")
+                r.close()
+                time.sleep(3)
+                # Reconnect via HID
+                log.step(6, TOTAL_STEPS, "Reconnecting after USB mode change...")
+                transport = detect_hid(log)
+                if transport:
+                    r = Sr3308(transport, log)
+                    log.ok(f"Reconnected via {transport.description}")
+                    # Verify USB mode stuck
+                    results["usb_mode_after"] = _safe(log, "USB GET (verify)",
+                                                      step_get_usb_mode, r, log, step_num=6)
+                else:
+                    log.fail("Could not reconnect after USB mode change.")
+                    log.info("    Unplug USB, wait 5 seconds, replug, and rerun.")
+                    log.close()
+                    sys.exit(4)
+        elif usb_mode == 2:
+            log.step(6, TOTAL_STEPS, "USB mode already HID-only — skipping")
+            log.ok("Keyboard interface already disabled")
+            results["set_usb_mode"] = "already set"
+            results["usb_mode_after"] = 2
+        else:
+            log.step(6, TOTAL_STEPS, "USB mode command not supported — skipping")
+            results["set_usb_mode"] = "not supported"
+
+        # Step 7: verify base params
+        results["params_after"] = _safe(log, "PARA GET (verify)", step_get_params, r, log, step_num=7)
+
+        # Steps 7-10: power, beep, inventory
         results["tx_power_before"] = _safe(log, "GET_TX_PWR", step_get_power, r, log)
         results["set_power"] = _safe(log, "SET_TX_PWR", step_set_power, r, log)
         results["beep_heard"] = _safe(log, "SOUND", step_beep, r, log)
         results["tags"] = _safe(log, "INVENTORY", step_inventory, r, log)
+
+        # Step 11: summary note about keyboard
+        log.step(11, TOTAL_STEPS, "Keyboard interface status")
+        if results.get("usb_mode_after") == 2:
+            log.ok("Keyboard interface is DISABLED — no phantom typing")
+        elif usb_mode is None:
+            log.warn("Could not check USB mode — keyboard may still be active")
+        else:
+            log.warn(f"USB mode = {results.get('usb_mode_after', '?')} — keyboard may still be active")
     finally:
         r.close()
 
@@ -933,6 +1032,9 @@ def main():
     log.info(f"  Device info:         {results.get('info')}")
     log.info(f"  Params before:       {results.get('params_before')}")
     log.info(f"  Set command mode:    {results.get('set_command_mode')}")
+    log.info(f"  USB mode before:     {results.get('usb_mode_before')} ({USBMODE_NAMES.get(results.get('usb_mode_before', -1), '?')})")
+    log.info(f"  Set USB mode:        {results.get('set_usb_mode')}")
+    log.info(f"  USB mode after:      {results.get('usb_mode_after')} ({USBMODE_NAMES.get(results.get('usb_mode_after', -1), '?')})")
     log.info(f"  Params after:        {results.get('params_after')}")
     log.info(f"  TX power before:     {results.get('tx_power_before')}")
     log.info(f"  Set TX power:        {results.get('set_power')}")

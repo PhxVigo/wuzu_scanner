@@ -290,6 +290,12 @@ try:
 except:
     SERIAL_AVAILABLE = False
 
+try:
+    import hid as hidapi
+    HID_AVAILABLE = True
+except:
+    HID_AVAILABLE = False
+
 
 class UHFReader:
     def __init__(self, port=None, baud=57600):
@@ -409,6 +415,260 @@ class UHFReader:
         self.send_command(0x21)
         resp = self.read_response()
         print(f"[UHF] Response: {resp.hex()}")
+
+    @property
+    def connected(self):
+        return self.ser is not None
+
+
+# =============================================================================
+# SR3308 UHF READER (USB HID)
+# =============================================================================
+class SR3308Reader:
+    """Yanzeo SR3308 UHF reader via USB HID.
+
+    Same public interface as UHFReader so the app can use either.
+    """
+    _PREAMBLE_TX = 0x7C
+    _PREAMBLE_RX = 0xCC
+    _VID = 0x04D8
+    _PID = 0x033F
+    _CMD_INVENTORY = 0x20
+    _CMD_GET_TX_PWR = 0x50
+    _CMD_SET_TX_PWR = 0x51
+    _CMD_PARA = 0x81
+    _CMD_INFO = 0x82
+    _CMD_SOUND = 0xBC
+    _CMD_USB = 0xBD
+    _MSG_CMD = 0x00
+    _MSG_SET = 0x31
+    _MSG_GET = 0x32
+
+    def __init__(self):
+        self.dev = None
+        if not HID_AVAILABLE:
+            print("[UHF] hidapi not available — SR3308 support disabled.")
+            return
+        self._connect()
+
+    def _connect(self):
+        """Find and connect to an SR3308 via USB HID."""
+        try:
+            devices = hidapi.enumerate(self._VID, self._PID)
+        except Exception as e:
+            print(f"[UHF] HID enumeration failed: {e}")
+            return
+
+        if not devices:
+            return
+
+        path = devices[0].get("path", b"")
+        try:
+            self.dev = hidapi.device()
+            self.dev.open_path(path)
+            self.dev.set_nonblocking(True)
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"[UHF] Could not open SR3308: {e}")
+            self.dev = None
+            return
+
+        # Verify with INFO GET
+        frames = self._send_receive(self._CMD_INFO, self._MSG_GET)
+        if not frames:
+            print("[UHF] SR3308 found but not responding — closing.")
+            self.dev.close()
+            self.dev = None
+            return
+
+        info = bytes(frames[0]["payload"]).decode("ascii", errors="replace").strip()
+        print(f"[UHF] SR3308 connected via HID ({info})")
+
+        # Check USB mode — warn if keyboard still active
+        usb_frames = self._send_receive(self._CMD_USB, self._MSG_GET)
+        if usb_frames and usb_frames[0]["len"] >= 1:
+            mode = usb_frames[0]["payload"][0]
+            if mode != 2:
+                print(f"[UHF] WARNING: keyboard interface active (USB mode={mode}).")
+                print("[UHF] Run detect_scanners.py to disable it.")
+
+        # Set command-polled mode
+        self._send_receive(self._CMD_PARA, self._MSG_SET, payload=bytes([0x01, 0x01]))
+
+        # Set power
+        self.set_power(20)
+
+    @property
+    def connected(self):
+        return self.dev is not None
+
+    # --- RCP Protocol Helpers ------------------------------------------------
+    @staticmethod
+    def _checksum(data):
+        return (-sum(data)) & 0xFF
+
+    def _build_frame(self, code, msg_type, payload=b""):
+        header = bytes([
+            self._PREAMBLE_TX, 0xFF, 0xFF,
+            code, msg_type, len(payload),
+        ])
+        body = header + bytes(payload)
+        return body + bytes([self._checksum(body)])
+
+    def _extract_frames(self, buf):
+        out = []
+        while True:
+            try:
+                idx = buf.index(self._PREAMBLE_RX)
+            except ValueError:
+                buf.clear()
+                return out
+            if idx > 0:
+                del buf[:idx]
+            if len(buf) < 7:
+                return out
+            length = buf[5]
+            total = 7 + length
+            if len(buf) < total:
+                return out
+            frame = bytes(buf[:total])
+            del buf[:total]
+            if (sum(frame) & 0xFF) != 0:
+                continue
+            out.append({
+                "code": frame[3],
+                "type_masked": frame[4] & 0x7F,
+                "len": length,
+                "payload": frame[6:6+length],
+            })
+
+    def _send_receive(self, code, msg_type, payload=b"", timeout=0.8):
+        if not self.dev:
+            return []
+        rcp = self._build_frame(code, msg_type, payload)
+        report = bytearray(64)
+        report[0] = 0x00
+        report[1] = len(rcp)
+        report[2:2+len(rcp)] = rcp
+        try:
+            self.dev.write(bytes(report))
+        except Exception:
+            return []
+
+        buf = bytearray()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                data = self.dev.read(64)
+            except Exception:
+                break
+            if data:
+                valid_len = data[0]
+                if 0 < valid_len < len(data):
+                    buf.extend(bytes(data[1:1+valid_len]))
+                if self._PREAMBLE_RX in buf:
+                    grace = time.time() + 0.15
+                    while time.time() < grace:
+                        try:
+                            more = self.dev.read(64)
+                        except Exception:
+                            break
+                        if more:
+                            vl = more[0]
+                            if 0 < vl < len(more):
+                                buf.extend(bytes(more[1:1+vl]))
+                    break
+            else:
+                time.sleep(0.01)
+
+        return self._extract_frames(buf)
+
+    # --- Public Methods (same interface as UHFReader) ------------------------
+    def inventory(self):
+        if not self.dev:
+            return []
+        frames = self._send_receive(self._CMD_INVENTORY, self._MSG_CMD, timeout=0.5)
+        tags = []
+        for f in frames:
+            if f["code"] == self._CMD_INVENTORY and f["type_masked"] == 0x02:
+                rec = self._parse_tag(f["payload"])
+                if rec and not any(t['epc'] == rec['epc'] for t in tags):
+                    tags.append(rec)
+        return tags
+
+    def _parse_tag(self, payload):
+        length = len(payload)
+        if length == 0:
+            return None
+        rssi = None
+        if length % 2 == 0:
+            rssi = payload[-1]
+            length -= 1
+        p = payload[:length]
+        if len(p) < 3:
+            return None
+        i = 0
+        i += 1  # skip antenna/tag-type byte
+        if i < len(p) and p[i] == 0x00:
+            i += 2
+        if i + 2 > len(p):
+            return None
+        pc = p[i:i+2]
+        epc_len = (pc[0] >> 3) * 2
+        if epc_len == 0 or i + 2 + epc_len > len(p):
+            return None
+        epc_bytes = p[i+2:i+2+epc_len]
+        return {
+            'epc': bytes(epc_bytes).hex().upper(),
+            'epc_bytes': bytes(epc_bytes),
+            'epc_len': epc_len,
+        }
+
+    def beep(self, active=2, silent=1, times=1):
+        if not self.dev:
+            return
+        self._send_receive(self._CMD_SOUND, self._MSG_CMD,
+                           payload=bytes([active, silent, times]), timeout=0.5)
+
+    def set_power(self, power):
+        if not self.dev:
+            return
+        if not 0 <= power <= 30:
+            raise ValueError("UHF power must be 0-30 dBm")
+        self._send_receive(self._CMD_SET_TX_PWR, self._MSG_SET,
+                           payload=bytes([power]))
+
+    def get_reader_info(self):
+        if not self.dev:
+            return
+        frames = self._send_receive(self._CMD_INFO, self._MSG_GET)
+        if frames:
+            info = bytes(frames[0]["payload"]).decode("ascii", errors="replace").strip()
+            print(f"[UHF] SR3308: {info}")
+
+
+def create_uhf_reader(config):
+    """Create the appropriate UHF reader based on config or auto-detection."""
+    hw = config.get('hardware', {})
+    uhf_type = (hw.get('uhf_type') or '').lower()
+    power = hw.get('uhf_power', 20)
+
+    if uhf_type == 'sr3308':
+        reader = SR3308Reader()
+    elif uhf_type == 'ur2000':
+        reader = UHFReader(port=hw.get('uhf_port'),
+                           baud=hw.get('uhf_baudrate', 57600))
+    else:
+        # Auto-detect: try SR3308 HID first, then UR-2000 serial
+        reader = SR3308Reader()
+        if not reader.connected:
+            reader = UHFReader(port=hw.get('uhf_port'),
+                               baud=hw.get('uhf_baudrate', 57600))
+
+    if reader.connected and power != 20:
+        reader.set_power(power)
+
+    return reader
 
 
 # =============================================================================
@@ -2935,10 +3195,7 @@ class WuzuApp:
         self.terminal.clear()
 
         self.nfc = NFCReader()
-        self.uhf = UHFReader(
-            port=config.get('hardware', {}).get('uhf_port'),
-            baud=config.get('hardware', {}).get('uhf_baudrate', 57600),
-        )
+        self.uhf = create_uhf_reader(config)
         
         # Database connection
         self.db = DatabaseManager(config)
@@ -2977,7 +3234,7 @@ class WuzuApp:
         if beep_cfg is None:
             return
 
-        if self.uhf.ser:
+        if self.uhf.connected:
             active, silent, times = beep_cfg
             self.uhf.beep(active, silent, times)
 
@@ -3090,6 +3347,7 @@ def get_default_config():
             'uhf_port': None,
             'uhf_baudrate': 57600,
             'uhf_power': 20,
+            'uhf_type': '',
         },
         'timing': {
             'scan_timeout': 5,

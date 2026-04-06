@@ -79,6 +79,16 @@ sudo usermod -aG dialout,input <your_user>
 newgrp dialout
 ```
 
+If using a **Yanzeo SR3308** UHF reader, set up udev rules so it works without sudo:
+```bash
+cat <<'EOF' | sudo tee /etc/udev/rules.d/99-sr3308.rules
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="04d8", ATTRS{idProduct}=="033f", MODE="0666"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04d8", ATTRS{idProduct}=="033f", MODE="0666"
+EOF
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
 ### 2. Install Python Dependencies
 
 ```bash

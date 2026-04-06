@@ -13,9 +13,10 @@ password = "your_password"
 
 [hardware]
 # UHF Reader settings
+uhf_type = ""               # "ur2000", "sr3308", or "" for auto-detect
 uhf_port = "COM3"           # Windows: "COM3", "COM9", etc. | Linux: "/dev/ttyUSB0"
-                            # Set to null for auto-detection
-uhf_baudrate = 57600        # Usually 57600 or 115200
+                            # Only used for UR-2000 (SR3308 uses USB HID auto-detect)
+uhf_baudrate = 57600        # Usually 57600 or 115200 (UR-2000 only)
 uhf_power = 20              # RF Power in dBm (0-30, higher = longer range)
 
 [timing]

@@ -6,30 +6,40 @@ Yanzeo SR3308 Diagnostic Tester
 Standalone diagnostic tool that exercises every SR3308 function wuzu-scanner
 will need, with verbose step-by-step hex tracing.
 
-Run this on a machine with the SR3308 plugged in via USB (appears as a COM
-port). It will:
+Run this on a machine with the SR3308 plugged in via USB. The reader
+defaults to USB-HID mode, so this script tries HID first, switches the
+reader to serial + command-polled mode, then reconnects over serial and
+runs the remaining tests.
 
-    1. Auto-detect which COM port has the SR3308
+    1. Auto-detect the SR3308 (HID first, then serial fallback)
     2. Read device info
     3. Read base parameters (current output/work mode)
     4. Switch the reader into serial + command-polled mode
-    5. Read current TX power
-    6. Set TX power to 20 dBm
-    7. Fire the beeper (you listen)
-    8. Run inventory polls against a placed Gen2 tag
+       (auto-reconnects over serial after the switch)
+    5. Verify the mode change
+    6. Read current TX power
+    7. Set TX power to 20 dBm
+    8. Fire the beeper (you listen)
+    9. Run inventory polls against a placed Gen2 tag
 
 Everything printed to the console is also written to a log file
     sr3308_test_YYYYMMDD_HHMMSS.log
 in the current directory. When something doesn't work, send that log back
 to the developer for analysis.
 
-Dependencies: pyserial only.
+Dependencies:
     pip install pyserial
 
+For HID support (recommended — needed if reader is in default HID mode):
+    sudo apt install libhidapi-dev    # Linux / Raspberry Pi
+    pip install hidapi
+
 Usage:
-    python test_sr3308.py              # auto-detect port
-    python test_sr3308.py COM5         # skip auto-detect, use COM5
-    python test_sr3308.py /dev/ttyUSB0 # Linux
+    python test_sr3308.py                 # auto-detect (HID first, then serial)
+    python test_sr3308.py --hid           # force HID-only detection
+    python test_sr3308.py --serial        # force serial-only detection
+    python test_sr3308.py /dev/ttyUSB0    # use explicit serial port
+    python test_sr3308.py COM5            # Windows explicit port
 
 Reference: docs/yanzeo-sr3308-protocol.md
 """
@@ -44,6 +54,13 @@ try:
 except ImportError:
     print("ERROR: pyserial is required. Install with: pip install pyserial")
     sys.exit(1)
+
+# HID support is optional — gracefully degrade if not available
+try:
+    import hid as hidapi
+    HID_AVAILABLE = True
+except ImportError:
+    HID_AVAILABLE = False
 
 
 # ----------------------------------------------------------------------------
@@ -105,6 +122,9 @@ SERIAL_BAUD = 57600
 SERIAL_TIMEOUT = 0.5  # seconds per read attempt
 INVENTORY_POLLS = 10
 INVENTORY_INTERVAL = 0.2  # seconds
+
+# HID report size (typical for USB full-speed HID)
+HID_REPORT_SIZE = 64
 
 
 # ----------------------------------------------------------------------------
@@ -174,16 +194,73 @@ def verify_checksum(frame):
     return (sum(frame) & 0xFF) == 0
 
 
+def extract_frames(rx_buf, log=None):
+    """Extract complete RCP frames from a byte buffer.
+
+    Modifies rx_buf in place (removes consumed bytes).
+    Returns list of parsed frame dicts.
+    """
+    out = []
+    while True:
+        try:
+            idx = rx_buf.index(PREAMBLE_RX)
+        except ValueError:
+            rx_buf.clear()
+            return out
+        if idx > 0:
+            if log:
+                log.warn(f"dropping {idx} pre-preamble byte(s): "
+                         + " ".join(f"{b:02X}" for b in rx_buf[:idx]))
+            del rx_buf[:idx]
+        if len(rx_buf) < 7:
+            return out
+        length = rx_buf[5]
+        total = 7 + length
+        if len(rx_buf) < total:
+            return out
+        frame = bytes(rx_buf[:total])
+        del rx_buf[:total]
+        if not verify_checksum(frame):
+            if log:
+                log.warn(f"bad checksum on frame (dropping preamble + resyncing): "
+                         + " ".join(f"{b:02X}" for b in frame))
+            continue
+        out.append({
+            "raw": frame,
+            "preamble": frame[0],
+            "addr": frame[1] | (frame[2] << 8),
+            "code": frame[3],
+            "type": frame[4],
+            "type_masked": frame[4] & 0x7F,
+            "len": length,
+            "payload": frame[6:6+length],
+            "checksum": frame[6+length],
+        })
+
+
+def log_parsed_frame(log, idx, f):
+    tm = f["type_masked"]
+    tm_name = {0x00: "OK", 0x01: "ERR", 0x02: "DATA", 0x05: "AUTO"}.get(tm, "?")
+    log.detail(
+        f"    <- frame[{idx}] addr=0x{f['addr']:04X}, "
+        f"code=0x{f['code']:02X} ({OPCODE_NAMES.get(f['code'],'?')}), "
+        f"type=0x{f['type']:02X} (masked=0x{tm:02X}/{tm_name}), "
+        f"len={f['len']}, payload="
+        + (" ".join(f"{b:02X}" for b in f["payload"]) or "(empty)")
+    )
+
+
 # ----------------------------------------------------------------------------
-# Reader class
+# Transport layer — abstract send/receive over HID or Serial
 # ----------------------------------------------------------------------------
-class Sr3308:
-    def __init__(self, port, log, baud=SERIAL_BAUD):
+class SerialTransport:
+    """Wraps pyserial for RCP communication."""
+    name = "serial"
+
+    def __init__(self, port, baud=SERIAL_BAUD):
         self.port = port
-        self.log = log
         self.baud = baud
         self.ser = None
-        self.rx_buf = bytearray()
 
     def open(self):
         self.ser = serial.Serial(self.port, baudrate=self.baud,
@@ -198,10 +275,117 @@ class Sr3308:
                 pass
             self.ser = None
 
+    def send(self, data):
+        self.ser.reset_input_buffer()
+        self.ser.write(data)
+        self.ser.flush()
+
+    def receive(self, timeout=0.8):
+        """Read bytes until timeout. Returns raw bytearray."""
+        buf = bytearray()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            chunk = self.ser.read(256)
+            if chunk:
+                buf.extend(chunk)
+            elif buf:
+                # got data, then silence — give a short grace period
+                grace = time.time() + 0.15
+                while time.time() < grace:
+                    more = self.ser.read(256)
+                    if more:
+                        buf.extend(more)
+                break
+        return buf
+
+    @property
+    def description(self):
+        return f"serial:{self.port}@{self.baud}"
+
+
+class HidTransport:
+    """Wraps hidapi for RCP communication over USB HID."""
+    name = "hid"
+
+    def __init__(self, device_path, vid=0, pid=0):
+        self.device_path = device_path
+        self.vid = vid
+        self.pid = pid
+        self.dev = None
+
+    def open(self):
+        self.dev = hidapi.device()
+        self.dev.open_path(self.device_path)
+        self.dev.set_nonblocking(True)
+
+    def close(self):
+        if self.dev:
+            try:
+                self.dev.close()
+            except Exception:
+                pass
+            self.dev = None
+
+    def send(self, data):
+        """Send RCP frame wrapped in an HID report.
+
+        HID reports: prepend 0x00 report ID, then the RCP frame bytes,
+        pad with 0x00 to HID_REPORT_SIZE.
+        """
+        report = bytearray(HID_REPORT_SIZE)
+        report[0] = 0x00  # report ID
+        report[1:1+len(data)] = data
+        self.dev.write(bytes(report))
+
+    def receive(self, timeout=0.8):
+        """Read HID reports until timeout, strip padding, return raw bytes."""
+        buf = bytearray()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            report = self.dev.read(HID_REPORT_SIZE)
+            if report:
+                # Strip trailing zero padding — RCP frames are shorter than
+                # the full report. We keep everything up to the last non-zero
+                # byte (or all of it if the frame legitimately contains zeros
+                # in the payload). The frame parser will handle validation.
+                buf.extend(bytes(report))
+                # Check if we have a plausible complete frame already
+                if PREAMBLE_RX in buf:
+                    # give a short grace for any follow-up reports
+                    grace = time.time() + 0.15
+                    while time.time() < grace:
+                        more = self.dev.read(HID_REPORT_SIZE)
+                        if more:
+                            buf.extend(bytes(more))
+                    break
+            else:
+                time.sleep(0.01)  # brief sleep to avoid busy-waiting
+        return buf
+
+    @property
+    def description(self):
+        return f"hid:{self.vid:04X}:{self.pid:04X} ({self.device_path})"
+
+
+# ----------------------------------------------------------------------------
+# Reader class — transport-agnostic
+# ----------------------------------------------------------------------------
+class Sr3308:
+    def __init__(self, transport, log):
+        self.transport = transport
+        self.log = log
+        self.rx_buf = bytearray()
+
+    def open(self):
+        self.transport.open()
+
+    def close(self):
+        self.transport.close()
+
     def send_and_receive(self, code, msg_type, payload=b"", *,
                          expect_frames=1, read_timeout=0.8):
-        """Build a TX frame, send it, drain RX for read_timeout seconds,
-        reassemble any 0xCC-preambled frames, and return a list of parsed frames.
+        """Build a TX frame, send it, drain RX, reassemble any 0xCC-preambled
+        frames, and return a list of parsed frames.
 
         Every step of this is logged in hex so remote debugging is possible."""
         tx = build_frame(code, msg_type, payload)
@@ -212,41 +396,18 @@ class Sr3308:
             f"payload_len={len(payload)}"
         )
 
-        self.ser.reset_input_buffer()
         self.rx_buf.clear()
-        self.ser.write(tx)
-        self.ser.flush()
-
-        deadline = time.time() + read_timeout
-        frames = []
-        raw = bytearray()
-        while time.time() < deadline:
-            chunk = self.ser.read(256)
-            if chunk:
-                raw.extend(chunk)
-                self.rx_buf.extend(chunk)
-                # try to extract frames
-                extracted = self._extract_frames()
-                frames.extend(extracted)
-                if expect_frames and len(frames) >= expect_frames:
-                    # small grace period for additional frames
-                    grace_end = time.time() + 0.15
-                    while time.time() < grace_end:
-                        more = self.ser.read(256)
-                        if more:
-                            raw.extend(more)
-                            self.rx_buf.extend(more)
-                            frames.extend(self._extract_frames())
-                    break
-            else:
-                # no new bytes; if we already have enough, stop
-                if expect_frames and len(frames) >= expect_frames:
-                    break
+        raw = self.transport.receive(timeout=0.05)  # flush any stale data
+        self.transport.send(tx)
+        raw = self.transport.receive(timeout=read_timeout)
 
         if raw:
             self.log.hex_line("RX", bytes(raw))
         else:
             self.log.warn("RX: (no bytes received before timeout)")
+
+        self.rx_buf.extend(raw)
+        frames = extract_frames(self.rx_buf, self.log)
 
         if not frames and raw:
             self.log.warn("Bytes were received but no valid 0xCC-framed packets could be parsed")
@@ -254,61 +415,9 @@ class Sr3308:
                 self.log.hex_line("buf", bytes(self.rx_buf))
 
         for i, f in enumerate(frames):
-            self._log_parsed_frame(i, f)
+            log_parsed_frame(self.log, i, f)
 
         return frames
-
-    def _extract_frames(self):
-        """Drain self.rx_buf of any complete frames. Returns list of dicts."""
-        out = []
-        while True:
-            # resync to 0xCC
-            try:
-                idx = self.rx_buf.index(PREAMBLE_RX)
-            except ValueError:
-                # no preamble in buffer at all
-                self.rx_buf.clear()
-                return out
-            if idx > 0:
-                # drop garbage before preamble
-                self.log.warn(f"dropping {idx} pre-preamble byte(s): "
-                              + " ".join(f"{b:02X}" for b in self.rx_buf[:idx]))
-                del self.rx_buf[:idx]
-            if len(self.rx_buf) < 7:
-                return out  # wait for more
-            length = self.rx_buf[5]
-            total = 7 + length
-            if len(self.rx_buf) < total:
-                return out  # wait for full frame
-            frame = bytes(self.rx_buf[:total])
-            del self.rx_buf[:total]
-            if not verify_checksum(frame):
-                self.log.warn(f"bad checksum on frame (dropping preamble + resyncing): "
-                              + " ".join(f"{b:02X}" for b in frame))
-                # dropped the bad frame; loop and try next preamble
-                continue
-            out.append({
-                "raw": frame,
-                "preamble": frame[0],
-                "addr": frame[1] | (frame[2] << 8),
-                "code": frame[3],
-                "type": frame[4],
-                "type_masked": frame[4] & 0x7F,
-                "len": length,
-                "payload": frame[6:6+length],
-                "checksum": frame[6+length],
-            })
-
-    def _log_parsed_frame(self, idx, f):
-        tm = f["type_masked"]
-        tm_name = {0x00: "OK", 0x01: "ERR", 0x02: "DATA", 0x05: "AUTO"}.get(tm, "?")
-        self.log.detail(
-            f"    <- frame[{idx}] addr=0x{f['addr']:04X}, "
-            f"code=0x{f['code']:02X} ({OPCODE_NAMES.get(f['code'],'?')}), "
-            f"type=0x{f['type']:02X} (masked=0x{tm:02X}/{tm_name}), "
-            f"len={f['len']}, payload="
-            + (" ".join(f"{b:02X}" for b in f["payload"]) or "(empty)")
-        )
 
 
 # ----------------------------------------------------------------------------
@@ -349,10 +458,98 @@ def parse_tag_record(payload):
 
 
 # ----------------------------------------------------------------------------
-# Port detection
+# HID device discovery
 # ----------------------------------------------------------------------------
-def detect_port(log):
-    log.info("Scanning COM ports for an SR3308...")
+def detect_hid(log):
+    """Enumerate HID devices and probe each with an INFO GET command.
+
+    Returns an HidTransport connected to the SR3308, or None.
+    """
+    if not HID_AVAILABLE:
+        log.warn("hidapi not installed — skipping HID detection")
+        log.detail("Install for HID support:")
+        log.detail("  sudo apt install libhidapi-dev   # Linux / Raspberry Pi")
+        log.detail("  pip install hidapi")
+        return None
+
+    log.info("Enumerating USB HID devices...")
+    try:
+        devices = hidapi.enumerate()
+    except Exception as e:
+        log.warn(f"HID enumeration failed: {e}")
+        return None
+
+    if not devices:
+        log.info("  No HID devices found")
+        return None
+
+    log.info(f"  Found {len(devices)} HID interface(s):")
+    for d in devices:
+        vid, pid = d.get("vendor_id", 0), d.get("product_id", 0)
+        mfg = d.get("manufacturer_string", "") or ""
+        prod = d.get("product_string", "") or ""
+        path = d.get("path", b"")
+        log.info(f"    VID={vid:04X} PID={pid:04X} mfg={mfg!r} prod={prod!r}")
+        log.detail(f"    path={path}")
+
+    # Try each HID device — send INFO GET and look for a valid RCP response
+    for d in devices:
+        vid = d.get("vendor_id", 0)
+        pid = d.get("product_id", 0)
+        path = d.get("path", b"")
+        mfg = d.get("manufacturer_string", "") or ""
+        prod = d.get("product_string", "") or ""
+
+        log.info(f"  Probing VID={vid:04X} PID={pid:04X} ({mfg} {prod})...")
+
+        transport = HidTransport(path, vid, pid)
+        try:
+            transport.open()
+        except Exception as e:
+            log.detail(f"    could not open: {e}")
+            continue
+
+        # Send INFO GET and see if we get a valid RCP frame back
+        info_frame = build_frame(CMD_INFO, MSG_GET)
+        log.hex_line("TX", info_frame)
+        try:
+            transport.send(info_frame)
+            raw = transport.receive(timeout=1.0)
+        except Exception as e:
+            log.detail(f"    send/receive error: {e}")
+            transport.close()
+            continue
+
+        if raw:
+            log.hex_line("RX", bytes(raw))
+        else:
+            log.detail("    no response")
+            transport.close()
+            continue
+
+        # Try to parse RCP frames from the response
+        rx_buf = bytearray(raw)
+        frames = extract_frames(rx_buf, log)
+        for f in frames:
+            if f["code"] == CMD_INFO and f["type_masked"] in (RSP_DATA, RSP_OK) and f["len"] >= 1:
+                info_text = bytes(f["payload"]).decode("ascii", errors="replace").strip()
+                log.ok(f"SR3308 found via HID! VID={vid:04X} PID={pid:04X}")
+                log.ok(f"Device info: {info_text!r}")
+                return transport
+
+        log.detail("    valid HID device but not an SR3308 (no INFO response)")
+        transport.close()
+
+    log.info("  No SR3308 found via HID")
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Serial port detection
+# ----------------------------------------------------------------------------
+def detect_serial(log):
+    """Scan COM ports for an SR3308. Returns a SerialTransport or None."""
+    log.info("Scanning serial/COM ports for an SR3308...")
     ports = list(serial.tools.list_ports.comports())
     if not ports:
         log.fail("No serial ports detected on this machine")
@@ -364,38 +561,81 @@ def detect_port(log):
 
     for p in ports:
         log.info(f"  Trying {p.device} @ {SERIAL_BAUD}...")
+        transport = SerialTransport(p.device)
         try:
-            r = Sr3308(p.device, log)
-            r.open()
+            transport.open()
         except Exception as e:
             log.warn(f"    could not open: {e}")
             continue
 
+        reader = Sr3308(transport, log)
         try:
-            frames = r.send_and_receive(CMD_INFO, MSG_GET, expect_frames=1, read_timeout=0.6)
+            frames = reader.send_and_receive(CMD_INFO, MSG_GET,
+                                             expect_frames=1, read_timeout=0.6)
         except Exception as e:
             log.warn(f"    send/receive error: {e}")
-            r.close()
+            transport.close()
             continue
-
-        r.close()
 
         for f in frames:
             if f["code"] == CMD_INFO and f["type_masked"] in (RSP_DATA, RSP_OK) and f["len"] >= 1:
                 log.ok(f"SR3308 responded on {p.device}")
-                return p.device
+                return transport
 
         log.detail("    no valid SR3308 response on this port")
+        transport.close()
 
-    log.fail("No SR3308 detected on any port")
+    log.fail("No SR3308 detected on any serial port")
+    return None
+
+
+def wait_for_serial_reconnect(log, max_wait=10):
+    """After switching from HID to serial mode, wait for the device to
+    re-enumerate as a serial port and return a SerialTransport.
+
+    Polls every second for up to max_wait seconds.
+    """
+    log.info(f"Waiting up to {max_wait}s for the reader to re-appear as a serial port...")
+
+    for elapsed in range(max_wait):
+        time.sleep(1)
+        log.detail(f"  ({elapsed+1}s) scanning ports...")
+        ports = list(serial.tools.list_ports.comports())
+        for p in ports:
+            # Skip well-known built-in ports that aren't USB
+            if p.device in ("/dev/ttyS0", "/dev/ttyAMA0"):
+                continue
+            log.detail(f"    trying {p.device} ({p.description})...")
+            transport = SerialTransport(p.device)
+            try:
+                transport.open()
+            except Exception:
+                continue
+            reader = Sr3308(transport, log)
+            try:
+                frames = reader.send_and_receive(CMD_INFO, MSG_GET,
+                                                 expect_frames=1, read_timeout=0.6)
+            except Exception:
+                transport.close()
+                continue
+            for f in frames:
+                if f["code"] == CMD_INFO and f["type_masked"] in (RSP_DATA, RSP_OK) and f["len"] >= 1:
+                    log.ok(f"SR3308 reconnected on {p.device}")
+                    return transport
+            transport.close()
+
+    log.fail("SR3308 did not appear on any serial port after mode switch")
     return None
 
 
 # ----------------------------------------------------------------------------
 # Test steps
 # ----------------------------------------------------------------------------
+TOTAL_STEPS = 9
+
+
 def step_info(r, log):
-    log.step(2, 8, "Getting device info (RCP_CMD_INFO, GET)")
+    log.step(2, TOTAL_STEPS, "Getting device info (RCP_CMD_INFO, GET)")
     frames = r.send_and_receive(CMD_INFO, MSG_GET, expect_frames=1, read_timeout=0.8)
     if not frames:
         log.fail("no response")
@@ -412,8 +652,8 @@ def step_info(r, log):
     return info_text
 
 
-def step_get_params(r, log):
-    log.step(3, 8, "Getting base parameters (RCP_CMD_PARA, GET)")
+def step_get_params(r, log, step_num=3):
+    log.step(step_num, TOTAL_STEPS, "Getting base parameters (RCP_CMD_PARA, GET)")
     frames = r.send_and_receive(CMD_PARA, MSG_GET, expect_frames=1, read_timeout=0.8)
     if not frames:
         log.fail("no response")
@@ -424,7 +664,7 @@ def step_get_params(r, log):
         return None
     pl = f["payload"]
     if len(pl) < 2:
-        log.fail(f"payload too short ({len(pl)} bytes, need ≥2)")
+        log.fail(f"payload too short ({len(pl)} bytes, need >= 2)")
         return None
     outputmode, workmode = pl[0], pl[1]
     om_name = OUTPUTMODE_NAMES.get(outputmode, f"unknown(0x{outputmode:02X})")
@@ -434,7 +674,7 @@ def step_get_params(r, log):
 
 
 def step_set_serial_mode(r, log):
-    log.step(4, 8, "Switching reader to serial + command-polled mode (RCP_CMD_PARA, SET)")
+    log.step(4, TOTAL_STEPS, "Switching reader to serial + command-polled mode (RCP_CMD_PARA, SET)")
     frames = r.send_and_receive(CMD_PARA, MSG_SET, payload=bytes([0x01, 0x01]),
                                 expect_frames=1, read_timeout=0.8)
     if not frames:
@@ -455,7 +695,7 @@ def step_set_serial_mode(r, log):
 
 
 def step_get_power(r, log):
-    log.step(5, 8, "Getting TX power (RCP_CMD_GET_TX_PWR, GET)")
+    log.step(6, TOTAL_STEPS, "Getting TX power (RCP_CMD_GET_TX_PWR, GET)")
     frames = r.send_and_receive(CMD_GET_TX_PWR, MSG_GET, expect_frames=1, read_timeout=0.8)
     if not frames:
         log.fail("no response")
@@ -473,7 +713,7 @@ def step_get_power(r, log):
 
 
 def step_set_power(r, log, dbm=20):
-    log.step(6, 8, f"Setting TX power to {dbm} dBm (RCP_CMD_SET_TX_PWR, SET)")
+    log.step(7, TOTAL_STEPS, f"Setting TX power to {dbm} dBm (RCP_CMD_SET_TX_PWR, SET)")
     frames = r.send_and_receive(CMD_SET_TX_PWR, MSG_SET, payload=bytes([dbm]),
                                 expect_frames=1, read_timeout=0.8)
     if not frames:
@@ -494,7 +734,7 @@ def step_set_power(r, log, dbm=20):
 
 
 def step_beep(r, log):
-    log.step(7, 8, "Testing beeper (RCP_CMD_SOUND, CMD) — 2 short beeps")
+    log.step(8, TOTAL_STEPS, "Testing beeper (RCP_CMD_SOUND, CMD) — 2 short beeps")
     log.info(">>> LISTEN FOR 2 SHORT BEEPS NOW <<<")
     frames = r.send_and_receive(CMD_SOUND, MSG_CMD, payload=bytes([0x02, 0x01, 0x02]),
                                 expect_frames=1, read_timeout=1.5)
@@ -509,7 +749,6 @@ def step_beep(r, log):
         log.warn(f"non-OK response type 0x{f['type']:02X}")
     else:
         log.ok("reader acknowledged the beep command")
-    # subjective check
     try:
         ans = input("    Did you hear the beeps? [y/N]: ").strip().lower()
     except EOFError:
@@ -519,7 +758,7 @@ def step_beep(r, log):
 
 
 def step_inventory(r, log):
-    log.step(8, 8, f"Inventory polls ({INVENTORY_POLLS} rounds @ {int(INVENTORY_INTERVAL*1000)} ms)")
+    log.step(9, TOTAL_STEPS, f"Inventory polls ({INVENTORY_POLLS} rounds @ {int(INVENTORY_INTERVAL*1000)} ms)")
     log.info(">>> Place an EPC Gen2 UHF tag on the reader, then press ENTER <<<")
     try:
         input()
@@ -529,8 +768,6 @@ def step_inventory(r, log):
     seen_epcs = {}
     for poll in range(1, INVENTORY_POLLS + 1):
         log.detail(f"  Poll {poll}/{INVENTORY_POLLS}:")
-        # Expect: 0..N data frames (one per tag) plus a terminating OK frame.
-        # We conservatively ask for many frames with a short-ish timeout.
         frames = r.send_and_receive(CMD_INVENTORY, MSG_CMD,
                                     expect_frames=0, read_timeout=0.5)
         tag_frames = [f for f in frames
@@ -570,43 +807,128 @@ def main():
     log.info("  Yanzeo SR3308 Diagnostic Tester")
     log.info("=" * 72)
 
-    # ---------------- Step 1: port detection ----------------
-    log.step(1, 8, "Detecting SR3308 on available COM ports")
+    # Parse CLI arguments
+    force_hid = "--hid" in sys.argv
+    force_serial = "--serial" in sys.argv
+    port_override = None
+    for arg in sys.argv[1:]:
+        if not arg.startswith("--"):
+            port_override = arg
+            break
 
-    port_override = sys.argv[1] if len(sys.argv) > 1 else None
+    # ---------------- Step 1: detection ----------------
+    log.step(1, TOTAL_STEPS, "Detecting SR3308")
+
+    transport = None
+    connected_via_hid = False
+
     if port_override:
-        log.info(f"Using port override from command line: {port_override}")
-        port = port_override
+        # Explicit serial port
+        log.info(f"Using explicit serial port from command line: {port_override}")
+        transport = SerialTransport(port_override)
+    elif force_serial:
+        log.info("Forced serial-only detection (--serial)")
+        transport = detect_serial(log)
+    elif force_hid:
+        log.info("Forced HID-only detection (--hid)")
+        transport = detect_hid(log)
+        if transport:
+            connected_via_hid = True
     else:
-        port = detect_port(log)
-        if not port:
+        # Default: try HID first, then fall back to serial
+        log.info("Trying HID detection first (reader defaults to USB-HID mode)...")
+        transport = detect_hid(log)
+        if transport:
+            connected_via_hid = True
+        else:
             log.info("")
-            log.info("Auto-detect failed. You can rerun with an explicit port:")
-            log.info("    python test_sr3308.py COM5")
-            log.info("    python test_sr3308.py /dev/ttyUSB0")
-            log.close()
-            sys.exit(2)
+            log.info("HID detection failed — falling back to serial port scan...")
+            transport = detect_serial(log)
 
-    # ---------------- Open the real session ----------------
-    r = Sr3308(port, log)
-    try:
-        r.open()
-    except Exception as e:
-        log.fail(f"Could not open {port}: {e}")
+    if not transport:
+        log.info("")
+        log.info("Could not find an SR3308 on any interface.")
+        log.info("")
+        log.info("Troubleshooting:")
+        log.info("  1. Is the SR3308 plugged in via USB?")
+        log.info("       lsusb                         # should show the device")
+        log.info("  2. Check for HID devices:")
+        log.info("       ls /dev/hidraw*")
+        log.info("  3. Check for serial devices:")
+        log.info("       ls /dev/ttyUSB* /dev/ttyACM*")
+        log.info("  4. Permissions — add your user to the input and dialout groups:")
+        log.info("       sudo usermod -aG input,dialout $USER")
+        log.info("       (then log out and back in)")
+        if not HID_AVAILABLE:
+            log.info("  5. Install hidapi for HID support:")
+            log.info("       sudo apt install libhidapi-dev")
+            log.info("       pip install hidapi")
+        log.info("")
+        log.info("You can also rerun with an explicit port:")
+        log.info("    python test_sr3308.py /dev/ttyUSB0")
         log.close()
-        sys.exit(3)
+        sys.exit(2)
 
-    results = {"port": port}
+    # ---------------- Open session ----------------
+    if port_override:
+        # Explicit port — need to open it
+        try:
+            transport.open()
+        except Exception as e:
+            log.fail(f"Could not open {port_override}: {e}")
+            log.close()
+            sys.exit(3)
 
-    # ---------------- Steps 2..8 ----------------
-    # Each step is wrapped so that a failure in one step doesn't abort the rest
+    r = Sr3308(transport, log)
+    log.ok(f"Connected via {transport.description}")
+
+    results = {"transport": transport.description}
+
+    # ---------------- Steps 2..9 ----------------
     try:
+        # Step 2: device info
         results["info"] = _safe(log, "INFO", step_info, r, log)
-        results["params_before"] = _safe(log, "PARA GET", step_get_params, r, log)
-        results["set_serial_mode"] = _safe(log, "PARA SET", step_set_serial_mode, r, log)
-        # re-read params to confirm the change took effect
-        log.step(4, 8, "Re-reading base parameters to confirm the change")
-        results["params_after"] = _safe(log, "PARA GET (verify)", step_get_params, r, log)
+
+        # Step 3: read current params
+        results["params_before"] = _safe(log, "PARA GET", step_get_params, r, log, step_num=3)
+
+        # Step 4: switch to serial + command mode
+        if connected_via_hid:
+            log.info("")
+            log.info("    Reader is connected via HID — will switch to serial mode")
+            log.info("    and reconnect over serial for remaining tests.")
+            mode_ok = _safe(log, "PARA SET", step_set_serial_mode, r, log)
+            results["set_serial_mode"] = mode_ok
+
+            if mode_ok:
+                # Close HID, wait for serial re-enumeration, reconnect
+                log.info("")
+                log.info("    Closing HID connection...")
+                r.close()
+                time.sleep(2)  # give the device a moment to re-enumerate
+
+                serial_transport = wait_for_serial_reconnect(log, max_wait=10)
+                if serial_transport:
+                    transport = serial_transport
+                    r = Sr3308(transport, log)
+                    connected_via_hid = False
+                    log.ok(f"Reconnected via {transport.description}")
+                else:
+                    log.fail("Could not reconnect over serial after mode switch.")
+                    log.info("    The mode change may still have worked. Try rerunning:")
+                    log.info("    python test_sr3308.py")
+                    log.close()
+                    sys.exit(4)
+            else:
+                log.warn("Mode switch failed or was rejected — continuing tests over HID")
+        else:
+            # Already on serial — still send the mode set to ensure correct config
+            results["set_serial_mode"] = _safe(log, "PARA SET", step_set_serial_mode, r, log)
+
+        # Step 5: verify params
+        results["params_after"] = _safe(log, "PARA GET (verify)", step_get_params, r, log, step_num=5)
+
+        # Steps 6-9: power, beep, inventory
         results["tx_power_before"] = _safe(log, "GET_TX_PWR", step_get_power, r, log)
         results["set_power"] = _safe(log, "SET_TX_PWR", step_set_power, r, log)
         results["beep_heard"] = _safe(log, "SOUND", step_beep, r, log)
@@ -619,7 +941,7 @@ def main():
     log.info("=" * 72)
     log.info("  SUMMARY")
     log.info("=" * 72)
-    log.info(f"  Port:                {results.get('port')}")
+    log.info(f"  Transport:           {results.get('transport')}")
     log.info(f"  Device info:         {results.get('info')}")
     log.info(f"  Params before:       {results.get('params_before')}")
     log.info(f"  Set serial+cmd mode: {results.get('set_serial_mode')}")

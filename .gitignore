@@ -14,9 +14,8 @@ backups/
 # Experimental
 Experimental/
 
-# Vendor SDKs and local docs
+# Vendor SDKs
 Yanzeo-SR3308-Series-VS-Demo-SDK/
-docs/
 
 # Test logs
 *.log

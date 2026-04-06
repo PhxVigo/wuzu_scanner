@@ -19,7 +19,9 @@ A terminal-based RFID hunting game using NFC badges for player identification an
 ## Hardware Requirements
 
 - **NFC Reader**: PC/SC compatible reader (e.g., ACR122U) for player badges
-- **UHF RFID Reader**: Serial-connected UHF reader (e.g., GeeNFC UHF reader, UR-2000)
+- **UHF RFID Reader**: One of:
+  - GeeNFC UR-2000 (serial/COM port)
+  - Yanzeo SR3308 (USB HID — auto-detected, no serial port needed)
 - **NFC Tags**: ISO14443A tags for player badges
 - **UHF Tags**: EPC Gen2 tags for wuzus
 
@@ -30,7 +32,8 @@ A terminal-based RFID hunting game using NFC badges for player identification an
 - PostgreSQL client tools (`pg_dump`) - needed for database backup during initialization
 - Python packages:
   - `psycopg2-binary` - PostgreSQL adapter
-  - `pyserial` - Serial communication for UHF reader
+  - `pyserial` - Serial communication for UHF reader (UR-2000)
+  - `hidapi` - USB HID communication for UHF reader (SR3308)
   - `pyscard` - Smart card/NFC reader support
   - `tomli` (Python < 3.11) - TOML configuration parser
 
@@ -54,7 +57,7 @@ A terminal-based RFID hunting game using NFC badges for player identification an
 **Linux (Debian/Ubuntu):**
 ```bash
 sudo apt update
-sudo apt install python3 python3-pip postgresql postgresql-contrib postgresql-client pcscd libpcsclite-dev
+sudo apt install python3 python3-pip postgresql postgresql-contrib postgresql-client pcscd libpcsclite-dev libhidapi-dev
 sudo systemctl start postgresql
 sudo systemctl enable postgresql
 sudo systemctl start pcscd
@@ -70,16 +73,16 @@ sudo modprobe -r pn533_usb pn533 nfc 2>/dev/null
 sudo systemctl start pcscd
 ```
 
-Make sure your user has acccess to the serial ports (replace <your_user> with your login)
+Make sure your user has access to serial ports and HID devices (replace <your_user> with your login)
 ```bash
-sudo usermod -aG dialout <your_user>
+sudo usermod -aG dialout,input <your_user>
 newgrp dialout
 ```
 
 ### 2. Install Python Dependencies
 
 ```bash
-pip install psycopg2-binary pyserial pyscard --break-system-packages
+pip install psycopg2-binary pyserial pyscard hidapi --break-system-packages
 
 # For Python < 3.11, also install tomli
 pip install tomli --break-system-packages
@@ -125,7 +128,7 @@ nano config.toml
 python3 detect_scanners.py
 ```
 
-Auto-detects NFC readers and serial UHF readers. Offers to update `config.toml` with detected hardware settings.
+Auto-detects NFC readers and UHF readers (both serial UR-2000 and USB HID SR3308). If an SR3308 is found with its keyboard interface active, offers to disable it. Updates `config.toml` with detected hardware settings.
 
 ### 7. Initialize System
 
@@ -184,7 +187,7 @@ sudo systemctl status pcscd
 pcsc_scan
 ```
 
-### UHF Reader Not Connecting
+### UHF Reader Not Connecting (UR-2000, serial)
 ```bash
 # List serial ports (Linux)
 ls -l /dev/ttyUSB*
@@ -194,6 +197,21 @@ ls -l /dev/ttyUSB*
 
 # Test serial connection
 python3 -c "import serial; print(serial.tools.list_ports.comports())"
+```
+
+### UHF Reader Not Connecting (SR3308, USB HID)
+```bash
+# Check if the device is visible on USB
+lsusb | grep 04d8:033f
+
+# Check HID devices
+ls /dev/hidraw*
+
+# Run the diagnostic test
+sudo python3 test_sr3308.py
+
+# If the reader is typing characters into your terminal,
+# run detect_scanners.py and choose to disable the keyboard interface
 ```
 
 ### Database Connection Failed

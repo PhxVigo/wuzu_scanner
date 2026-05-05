@@ -64,13 +64,68 @@ if platform.system() == "Windows":
             except:
                 return None
         return None
+
+    def _ensure_cbreak():
+        # No-op on Windows; msvcrt handles input directly.
+        return
 else:
     import termios, tty, select
+
     def read_key():
+        # Unbuffered stdin read so select() and the read stay in sync (sys.stdin's
+        # TextIOWrapper has its own buffer that can desync from the fd). Also
+        # distinguish a bare Esc press from an escape sequence (arrow keys etc.):
+        # if no follow-up bytes arrive within ~50 ms, treat as a bare Esc and
+        # return '\x1b'; otherwise drain the sequence and return None so its
+        # bytes don't leak into name/password input handlers.
         dr, _, _ = select.select([sys.stdin], [], [], 0)
-        if dr:
-            return sys.stdin.read(1)
-        return None
+        if not dr:
+            return None
+        try:
+            ch = os.read(0, 1)
+        except (BlockingIOError, OSError):
+            return None
+        if not ch:
+            return None
+        if ch == b'\x1b':
+            had_followup = False
+            deadline = time.monotonic() + 0.05
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                dr, _, _ = select.select([sys.stdin], [], [], remaining)
+                if not dr:
+                    break
+                try:
+                    extra = os.read(0, 1)
+                except OSError:
+                    break
+                if not extra:
+                    break
+                had_followup = True
+            return None if had_followup else '\x1b'
+        try:
+            return ch.decode('utf-8', errors='ignore') or None
+        except Exception:
+            return None
+
+    def _ensure_cbreak():
+        # Defensive re-assert: if anything has flipped ICANON/ECHO back on, or
+        # restored ICRNL, the next call restores the modes the app expects.
+        # Cheap; only writes when state has actually drifted.
+        try:
+            mode = termios.tcgetattr(sys.stdin)
+        except Exception:
+            return
+        if (mode[3] & termios.ICANON) or (mode[3] & termios.ECHO) or (mode[0] & termios.ICRNL):
+            try:
+                tty.setcbreak(sys.stdin)
+                mode = termios.tcgetattr(sys.stdin)
+                mode[0] &= ~termios.ICRNL
+                termios.tcsetattr(sys.stdin, termios.TCSANOW, mode)
+            except Exception:
+                pass
 
 
 # =============================================================================
@@ -261,24 +316,45 @@ class NFCReader:
     def poll_for_card(self):
         if not self.connection:
             return None
+
         try:
             self.connection.connect()
-            if not self.card_present:
-                data, sw1, sw2 = self.connection.transmit(GET_UID)
-                if (sw1, sw2) == (0x90, 0x00):
-                    uid = ''.join(f"{b:02x}" for b in data).lower()
-                    self.current_uid = uid
-                    self.card_present = True
-                    return uid
-            return None
-
         except (NoCardException, CardConnectionException):
             self.card_present = False
             self.current_uid = None
-        except:
-            pass
+            return None
+        except Exception as e:
+            # Unknown PCSC error — assume no card; clear state so we don't strand a stale UID
+            if self.card_present or self.current_uid:
+                print(f"\r[NFC] connect error, resetting: {e}", flush=True)
+            self.card_present = False
+            self.current_uid = None
+            return None
 
-        return None
+        try:
+            data, sw1, sw2 = self.connection.transmit(GET_UID)
+        except (NoCardException, CardConnectionException):
+            self.card_present = False
+            self.current_uid = None
+            return None
+        except Exception as e:
+            print(f"\r[NFC] transmit error: {e}", flush=True)
+            self.card_present = False
+            self.current_uid = None
+            return None
+
+        if (sw1, sw2) != (0x90, 0x00):
+            return None
+
+        uid = ''.join(f"{b:02x}" for b in data).lower()
+        # UID-based dedup: same card still on reader → no new event.
+        # If the user hot-swaps to a different card before we observe a NoCardException,
+        # the UID will differ and we still emit the new scan.
+        if self.card_present and uid == self.current_uid:
+            return None
+        self.current_uid = uid
+        self.card_present = True
+        return uid
 
 
 # =============================================================================
@@ -1395,9 +1471,15 @@ class DatabaseManager:
             return {'status': 'OFFLINE', 'version': None, 'host': None}
     
     def close(self):
-        """Close database connection"""
+        """Close database connection (idempotent)."""
+        if getattr(self, '_closed', False):
+            return
+        self._closed = True
         if self.conn:
-            self.conn.close()
+            try:
+                self.conn.close()
+            finally:
+                self.conn = None
             print("[DB] Connection closed")
 
 # =============================================================================
@@ -1865,7 +1947,7 @@ class AddHunterScreen(Screen):
             return
 
         if self.state == self.STATE_SCAN:
-            if key == "x":
+            if key == "\x1b":
                 self.app.log_event("CANCEL", details="Add-Hunter cancelled")
                 self.app.switch_screen(StartScreen(self.app))
                 return
@@ -1895,7 +1977,7 @@ class AddHunterScreen(Screen):
                 self.app.tui.mark_dirty(PANEL_MAIN)
 
         elif self.state == self.STATE_CONFIRM:
-            if key == "x":
+            if key == "\x1b":
                 self.app.log_event("CANCEL", details="Add-Hunter cancelled")
                 self.app.switch_screen(StartScreen(self.app))
                 return
@@ -1949,9 +2031,9 @@ class AddHunterScreen(Screen):
         
         if self.state == self.STATE_SCAN:
             bounded.print_content(1, "Waiting for NFC scan...")
-            bounded.print_content(2, "[X] Cancel")
+            bounded.print_content(2, "[Esc] Cancel")
         else:
-            bounded.print_content(1, "[X] Cancel and return to main screen")
+            bounded.print_content(1, "[Esc] Cancel and return to main screen")
 
 
 # =============================================================================
@@ -2097,7 +2179,7 @@ class AdminScreen(Screen):
             self._handle_scan_out(key)
 
     def _handle_password(self, key):
-        if key == "x":
+        if key == "\x1b":
             self.app.switch_screen(StartScreen(self.app))
         elif key == "\r":
             if self.app.db.verify_admin_password(self.admin_uid, self.password_input):
@@ -2156,7 +2238,7 @@ class AdminScreen(Screen):
             self.scan_out_last_time = time.time()
             self.state = self.STATE_SCAN_OUT
             self.app.tui.force_full_redraw()
-        elif key == "x":
+        elif key == "\x1b":
             self.app.switch_screen(StartScreen(self.app))
 
     def _handle_quit_confirm(self, key):
@@ -2171,7 +2253,7 @@ class AdminScreen(Screen):
             self.app.tui.force_full_redraw()
 
     def _handle_override_scan_badge(self, key, uid):
-        if key == "x":
+        if key == "\x1b":
             self.state = self.STATE_MENU
             self.app.tui.force_full_redraw()
         elif uid:
@@ -2183,7 +2265,7 @@ class AdminScreen(Screen):
                 self.app.switch_screen(ScanWuzuScreen(self.app, uid, override=True))
 
     def _handle_scan_out(self, key):
-        if key == "x":
+        if key == "\x1b":
             self.state = self.STATE_MENU
             self.app.tui.force_full_redraw()
             return
@@ -2218,7 +2300,7 @@ class AdminScreen(Screen):
         self.app.tui.mark_dirty(PANEL_FOOTER)
 
     def _handle_edit_hunter_scan(self, key, uid):
-        if key == "x":
+        if key == "\x1b":
             self.state = self.STATE_MENU
             self.app.tui.force_full_redraw()
             return
@@ -2243,7 +2325,7 @@ class AdminScreen(Screen):
                 self.app.tui.mark_dirty(PANEL_MAIN)
 
     def _handle_edit_hunter_menu(self, key):
-        if key == "x":
+        if key == "\x1b":
             self.state = self.STATE_MENU
             self.app.tui.force_full_redraw()
         elif key == "n":
@@ -2264,7 +2346,7 @@ class AdminScreen(Screen):
                 self.app.tui.mark_dirty(PANEL_SECONDARY)
 
     def _handle_edit_hunter_name(self, key):
-        if key == "x":
+        if key == "\x1b":
             self.state = self.STATE_EDIT_HUNTER_MENU
             self.app.tui.force_full_redraw()
         elif key == "\r":
@@ -2284,7 +2366,7 @@ class AdminScreen(Screen):
                 self.app.tui.mark_dirty(PANEL_MAIN)
 
     def _handle_adjust_score(self, key):
-        if key == "x":
+        if key == "\x1b":
             self.state = self.STATE_EDIT_HUNTER_MENU
             self.app.tui.force_full_redraw()
         elif key == "\r":
@@ -2310,7 +2392,7 @@ class AdminScreen(Screen):
             self.app.tui.mark_dirty(PANEL_MAIN)
 
     def _handle_add_admin_scan(self, key, uid):
-        if key == "x":
+        if key == "\x1b":
             self.state = self.STATE_MENU
             self.app.tui.force_full_redraw()
         elif uid:
@@ -2329,7 +2411,7 @@ class AdminScreen(Screen):
             self.app.tui.force_full_redraw()
 
     def _handle_add_admin_name(self, key):
-        if key == "x":
+        if key == "\x1b":
             self.state = self.STATE_MENU
             self.app.tui.force_full_redraw()
         elif key == "\r":
@@ -2351,7 +2433,7 @@ class AdminScreen(Screen):
                 self.app.tui.mark_dirty(PANEL_MAIN)
 
     def _handle_add_admin_password(self, key):
-        if key == "x":
+        if key == "\x1b":
             self.state = self.STATE_MENU
             self.app.tui.force_full_redraw()
         elif key == "\r":
@@ -2375,7 +2457,7 @@ class AdminScreen(Screen):
             self.app.tui.mark_dirty(PANEL_MAIN)
 
     def _handle_edit_wuzu_scan(self, key):
-        if key == "x":
+        if key == "\x1b":
             self.state = self.STATE_MENU
             self.app.tui.force_full_redraw()
             return
@@ -2410,7 +2492,7 @@ class AdminScreen(Screen):
             self.app.tui.mark_dirty(PANEL_FOOTER)
 
     def _handle_edit_wuzu_menu(self, key):
-        if key == "x":
+        if key == "\x1b":
             self.state = self.STATE_MENU
             self.app.tui.force_full_redraw()
         elif key == "n":
@@ -2454,7 +2536,7 @@ class AdminScreen(Screen):
             self.app.tui.force_full_redraw()
 
     def _handle_edit_wuzu_input(self, key, field):
-        if key == "x":
+        if key == "\x1b":
             self.state = self.STATE_EDIT_WUZU_MENU
             self.app.tui.force_full_redraw()
         elif key == "\r":
@@ -2534,7 +2616,7 @@ class AdminScreen(Screen):
         bounded.print_centered(start_row + 2, "Enter password:")
         masked = "*" * len(self.password_input)
         bounded.print_centered(start_row + 3, f"> {masked}_")
-        bounded.print_centered(start_row + 5, "[Enter] Submit    [X] Cancel")
+        bounded.print_centered(start_row + 5, "[Enter] Submit    [Esc] Cancel")
 
     def _render_menu(self, bounded):
         admin_name = self.admin.get('name', self.admin_uid) if self.admin else self.admin_uid
@@ -2546,7 +2628,7 @@ class AdminScreen(Screen):
         bounded.print_centered(start_row + 2, "[W] Add Wuzu Tag       [E] Edit Wuzu")
         bounded.print_centered(start_row + 3, "[H] Edit Hunter        [A] Add New Admin")
         bounded.print_centered(start_row + 4, "[O] Override Scan      [S] Scan Out Wuzus")
-        bounded.print_centered(start_row + 5, "[Q] Quit Application   [X] Exit Admin Mode")
+        bounded.print_centered(start_row + 5, "[Q] Quit Application   [Esc] Exit Admin Mode")
 
     def _render_quit_confirm(self, bounded):
         bounded.set_title("QUIT APPLICATION")
@@ -2562,7 +2644,7 @@ class AdminScreen(Screen):
         bounded.print_centered(start_row, "ADMIN OVERRIDE SCAN")
         bounded.print_centered(start_row + 2, "Scan hunter badge to begin...")
         bounded.print_centered(start_row + 4, "All validation will be skipped!")
-        bounded.print_centered(start_row + 5, "[X] Cancel")
+        bounded.print_centered(start_row + 5, "[Esc] Cancel")
 
     def _render_scan_out(self, bounded):
         bounded.set_title("SCAN OUT WUZUS")
@@ -2599,7 +2681,7 @@ class AdminScreen(Screen):
         bounded.print_content(3, f"Points:    {hunter_pts}")
         bounded.print_content(4, f"Last Seen: {last_seen_str}")
         bounded.print_content(6, "[N] Edit Name   [M] Manual Adjust")
-        bounded.print_content(7, "[X] Back to Admin Menu")
+        bounded.print_content(7, "[Esc] Back to Admin Menu")
 
     def _render_edit_hunter_name(self, bounded):
         bounded.set_title("EDIT HUNTER - NAME")
@@ -2610,7 +2692,7 @@ class AdminScreen(Screen):
         bounded.print_centered(start_row, f"Hunter: {hunter_name}")
         bounded.print_centered(start_row + 2, "Enter new name:")
         bounded.print_centered(start_row + 3, f"> {self.edit_hunter_input}_")
-        bounded.print_centered(start_row + 5, "[Enter] Save    [X] Cancel")
+        bounded.print_centered(start_row + 5, "[Enter] Save    [Esc] Cancel")
 
     def _render_adjust_score(self, bounded):
         bounded.set_title("MANUAL SCORE ADJUSTMENT")
@@ -2621,7 +2703,7 @@ class AdminScreen(Screen):
         bounded.print_centered(start_row, f"Hunter: {hunter_name}")
         bounded.print_centered(start_row + 2, "Enter point adjustment (e.g. 10 or -5):")
         bounded.print_centered(start_row + 3, f"> {self.adjust_input}_")
-        bounded.print_centered(start_row + 5, "[Enter] Apply    [X] Cancel")
+        bounded.print_centered(start_row + 5, "[Enter] Apply    [Esc] Cancel")
 
     def _render_add_admin_scan(self, bounded):
         bounded.set_title("ADD NEW ADMIN")
@@ -2631,7 +2713,7 @@ class AdminScreen(Screen):
         bounded.print_centered(start_row, "Scan NFC badge of new admin...")
         if self.add_admin_error:
             bounded.print_centered(start_row + 2, f"ERROR: {self.add_admin_error}")
-        bounded.print_centered(start_row + 4, "[X] Cancel")
+        bounded.print_centered(start_row + 4, "[Esc] Cancel")
 
     def _render_add_admin_name(self, bounded):
         bounded.set_title("ADD NEW ADMIN")
@@ -2641,7 +2723,7 @@ class AdminScreen(Screen):
         bounded.print_centered(start_row, f"Badge UID: {self.new_admin_uid}")
         bounded.print_centered(start_row + 2, "Enter admin name:")
         bounded.print_centered(start_row + 3, f"> {self.new_admin_name}_")
-        bounded.print_centered(start_row + 5, "[Enter] Confirm    [X] Cancel")
+        bounded.print_centered(start_row + 5, "[Enter] Confirm    [Esc] Cancel")
 
     def _render_add_admin_password(self, bounded):
         bounded.set_title("ADD NEW ADMIN - SET PASSWORD")
@@ -2652,7 +2734,7 @@ class AdminScreen(Screen):
         bounded.print_centered(start_row + 2, "Create a password (cannot be blank):")
         masked = "*" * len(self.new_admin_password) if hasattr(self, 'new_admin_password') else ""
         bounded.print_centered(start_row + 3, f"> {masked}_")
-        bounded.print_centered(start_row + 5, "[Enter] Confirm    [X] Cancel")
+        bounded.print_centered(start_row + 5, "[Enter] Confirm    [Esc] Cancel")
 
     def _render_edit_wuzu_scan(self, bounded):
         bounded.set_title("EDIT WUZU")
@@ -2675,7 +2757,7 @@ class AdminScreen(Screen):
         bounded.print_content(4, f"Fact:   {wuzu.get('fact') or '(none)'}")
         bounded.print_content(5, f"Found:  {wuzu.get('times_found', 0)} times")
         bounded.print_content(7, "[N] Edit Name   [P] Edit Points   [F] Edit Fact   [D] Delete")
-        bounded.print_content(8, "[X] Back to Admin Menu")
+        bounded.print_content(8, "[Esc] Back to Admin Menu")
 
     def _render_delete_wuzu_confirm(self, bounded):
         bounded.set_title("CONFIRM DELETE WUZU")
@@ -2704,7 +2786,7 @@ class AdminScreen(Screen):
         bounded.print_centered(start_row, f"Wuzu: {wuzu_name}")
         bounded.print_centered(start_row + 2, f"Enter new {field_label.lower()}:")
         bounded.print_centered(start_row + 3, f"> {self.edit_wuzu_input}_")
-        bounded.print_centered(start_row + 5, "[Enter] Save    [X] Cancel")
+        bounded.print_centered(start_row + 5, "[Enter] Save    [Esc] Cancel")
 
     def render_secondary(self, bounded, app_state):
         if self.state in (self.STATE_EDIT_HUNTER_MENU, self.STATE_EDIT_HUNTER_NAME,
@@ -2785,33 +2867,33 @@ class AdminScreen(Screen):
     def render_footer(self, bounded, app_state):
         bounded.set_title("ADMIN CONTROLS")
         if self.state == self.STATE_PASSWORD:
-            bounded.print_content(1, "[Enter] Submit  [X] Cancel")
+            bounded.print_content(1, "[Enter] Submit  [Esc] Cancel")
         elif self.state == self.STATE_MENU:
-            bounded.print_content(1, "[W] Wuzu [E] Edit [H] Hunter [A] Admin [O] Override [S] Scan Out [Q] Quit [X] Exit")
+            bounded.print_content(1, "[W] Wuzu [E] Edit [H] Hunter [A] Admin [O] Override [S] Scan Out [Q] Quit [Esc] Exit")
         elif self.state == self.STATE_EDIT_HUNTER_SCAN:
-            bounded.print_content(1, "[X] Cancel")
+            bounded.print_content(1, "[Esc] Cancel")
         elif self.state == self.STATE_EDIT_HUNTER_MENU:
-            bounded.print_content(1, "[N] Edit Name  [M] Manual Adjust  [J/K] Navigate History  [X] Back")
+            bounded.print_content(1, "[N] Edit Name  [M] Manual Adjust  [J/K] Navigate History  [Esc] Back")
         elif self.state == self.STATE_EDIT_HUNTER_NAME:
-            bounded.print_content(1, "[Enter] Save  [X] Cancel")
+            bounded.print_content(1, "[Enter] Save  [Esc] Cancel")
         elif self.state == self.STATE_ADJUST_SCORE:
-            bounded.print_content(1, "[Enter] Apply  [X] Cancel")
+            bounded.print_content(1, "[Enter] Apply  [Esc] Cancel")
         elif self.state in (self.STATE_ADD_ADMIN_SCAN, self.STATE_ADD_ADMIN_NAME,
                             self.STATE_ADD_ADMIN_PASSWORD):
-            bounded.print_content(1, "[X] Cancel")
+            bounded.print_content(1, "[Esc] Cancel")
         elif self.state == self.STATE_EDIT_WUZU_SCAN:
-            bounded.print_content(1, "[X] Cancel")
+            bounded.print_content(1, "[Esc] Cancel")
         elif self.state == self.STATE_EDIT_WUZU_MENU:
-            bounded.print_content(1, "[N] Name  [P] Points  [F] Fact  [D] Delete  [J/K] Navigate History  [X] Back")
+            bounded.print_content(1, "[N] Name  [P] Points  [F] Fact  [D] Delete  [J/K] Navigate History  [Esc] Back")
         elif self.state in (self.STATE_EDIT_WUZU_NAME, self.STATE_EDIT_WUZU_POINTS,
                             self.STATE_EDIT_WUZU_FACT):
-            bounded.print_content(1, "[Enter] Save  [X] Cancel")
+            bounded.print_content(1, "[Enter] Save  [Esc] Cancel")
         elif self.state == self.STATE_DELETE_WUZU_CONFIRM:
             bounded.print_content(1, "[Y] Confirm Delete  [N] Cancel")
         elif self.state == self.STATE_OVERRIDE_SCAN_BADGE:
-            bounded.print_content(1, "Scan hunter badge...  [X] Cancel")
+            bounded.print_content(1, "Scan hunter badge...  [Esc] Cancel")
         elif self.state == self.STATE_SCAN_OUT:
-            bounded.print_content(1, "Scanning out wuzus...  [X] Exit")
+            bounded.print_content(1, "Scanning out wuzus...  [Esc] Exit")
 
 
 # =============================================================================
@@ -2855,7 +2937,7 @@ class AddWuzuScreen(Screen):
                 self.app.switch_screen(self.on_return())
                 return
 
-            if key == "x":
+            if key == "\x1b":
                 self.app.log_event("CANCEL", details="Add-Wuzu cancelled")
                 self.app.switch_screen(self.on_return())
                 return
@@ -2928,11 +3010,11 @@ class AddWuzuScreen(Screen):
 
         if self.state == self.STATE_SCAN:
             bounded.print_content(1, "Scan new Wuzu tag with UHF reader...")
-            bounded.print_content(2, "[X] Cancel")
+            bounded.print_content(2, "[Esc] Cancel")
         elif self.state == self.STATE_READD_CONFIRM:
             bounded.print_content(1, "[Y] Re-add  [N] Cancel")
         else:
-            bounded.print_content(1, "[X] Return to main screen")
+            bounded.print_content(1, "[Esc] Return to main screen")
 
 
 # =============================================================================
@@ -2967,7 +3049,7 @@ class ScanWuzuScreen(Screen):
             self.app.tui.force_full_redraw()
             return
 
-        if key == "x":
+        if key == "\x1b":
             hunter = self.app.db.get_hunter(self.hunter_uid)
             name = hunter['name'] if hunter else "Unknown"
             self.app.log_event("EXIT", hunter_uid=self.hunter_uid, 
@@ -3068,7 +3150,7 @@ class ScanWuzuScreen(Screen):
         title = "OVERRIDE MODE" if self.override else "SCORING MODE"
         bounded.set_title(title)
         bounded.print_content(1, "Scan Wuzus to score points!")
-        bounded.print_content(2, "[X] Exit")
+        bounded.print_content(2, "[Esc] Exit")
 
 
 # =============================================================================
@@ -3112,7 +3194,7 @@ class ResultsScreen(Screen):
         # Always update footer to show countdown
         self.app.tui.mark_dirty(PANEL_FOOTER)
         
-        if key == "x" or remaining <= 0:
+        if key == "\x1b" or remaining <= 0:
             self.app.switch_screen(StartScreen(self.app))
 
     def render_main(self, bounded, app_state):
@@ -3164,7 +3246,7 @@ class ResultsScreen(Screen):
     def render_footer(self, bounded, app_state):
         bounded.set_title("RESULTS")
         bounded.print_content(1, "Returning to main screen...")
-        bounded.print_content(2, "[X] Return now")
+        bounded.print_content(2, "[Esc] Return now")
 
 
 # =============================================================================
@@ -3299,35 +3381,49 @@ class WuzuApp:
 
         try:
             while True:
-                time.sleep(self.config.get('timing', {}).get('nfc_poll_interval', 0.05))
+                try:
+                    time.sleep(self.config.get('timing', {}).get('nfc_poll_interval', 0.05))
 
-                key = read_key()
+                    key = read_key()
 
-                uid = self.nfc.poll_for_card()
-                self.screen.handle(key, uid)
+                    uid = self.nfc.poll_for_card()
+                    self.screen.handle(key, uid)
 
-                now = time.time()
+                    now = time.time()
 
-                # Update time display every second
-                if now - self.last_time_update >= 1:
-                    self.tui.mark_dirty(PANEL_STATUS)
-                    self.last_time_update = now
-
-                # Refresh leaderboard data periodically
-                if now - self.last_data_refresh >= self.data_refresh_interval:
-                    self.tui.mark_dirty(PANEL_MAIN)
-                    self.last_data_refresh = now
-
-                # Check database health periodically
-                if now - self.last_db_health_check >= self.db_health_check_interval:
-                    db_status = self.db.test_connection()
-                    if db_status['status'] != self.db_status:
-                        old_status = self.db_status
-                        self.db_status = db_status['status']
+                    # Update time display every second
+                    if now - self.last_time_update >= 1:
+                        _ensure_cbreak()
                         self.tui.mark_dirty(PANEL_STATUS)
-                    self.last_db_health_check = now
+                        self.last_time_update = now
 
-                self.tui.render(self.screen, self.terminal, self.data)
+                    # Refresh leaderboard data periodically
+                    if now - self.last_data_refresh >= self.data_refresh_interval:
+                        self.tui.mark_dirty(PANEL_MAIN)
+                        self.last_data_refresh = now
+
+                    # Check database health periodically
+                    if now - self.last_db_health_check >= self.db_health_check_interval:
+                        db_status = self.db.test_connection()
+                        if db_status['status'] != self.db_status:
+                            old_status = self.db_status
+                            self.db_status = db_status['status']
+                            self.tui.mark_dirty(PANEL_STATUS)
+                        self.last_db_health_check = now
+
+                    self.tui.render(self.screen, self.terminal, self.data)
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as e:
+                    # Survive transient errors (DB blip, screen handler glitch, render hiccup)
+                    # so the kiosk doesn't need a manual restart. Force a full repaint
+                    # next iteration.
+                    try:
+                        print(f"\r[LOOP] recovered from: {type(e).__name__}: {e}", flush=True)
+                    except Exception:
+                        pass
+                    self.tui.mark_dirty(PANEL_MAIN)
+                    self.tui.mark_dirty(PANEL_STATUS)
 
         except KeyboardInterrupt:
             pass
